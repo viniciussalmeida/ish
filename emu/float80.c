@@ -4,6 +4,8 @@
 #include <math.h>
 #include "float80.h"
 
+typedef unsigned __int128 uint128_t;
+
 // If you don't understand why something is the way it is, change it and run
 // the test suite and all will become clear.
 
@@ -34,16 +36,18 @@ __thread enum f80_rounding_mode f80_rounding_mode;
 // shift a 128 bit integer right but using the floating point rounding mode
 // used by f80_shift_right and to round the 128-bit result of multiplying significands
 // sign is necessary to decide which way to round when mode is round_up or round_down
-static unsigned __int128 u128_shift_right_round(unsigned __int128 i, int shift, int sign) {
+static uint128_t u128_shift_right_round(uint128_t i, int shift, int sign) {
     // we're going to be shifting stuff by shift - 1, so stay safe
     if (shift == 0)
         return i;
+    if (shift > 127)
+        return 0;
 
     // stuff necessary for rounding to nearest or even. reference: https://stackoverflow.com/a/8984135
     // grab the guard bit, the last bit shifted out
     int guard = (i >> (shift - 1)) & 1;
     // now grab the rest of the bits being shifted out
-    int rest = i & ~(-1ul << (shift - 1));
+    uint64_t rest = i & ~(-1ul << (shift - 1));
 
     i >>= shift;
     switch (f80_rounding_mode) {
@@ -77,11 +81,7 @@ static float80 f80_shift_left(float80 f, int shift) {
 
 // may lose precision
 static float80 f80_shift_right(float80 f, int shift) {
-    if (shift > 63)
-        // shifts beyond the size of the type are undefined behavior
-        f.signif = 0;
-    else
-        f.signif = u128_shift_right_round(f.signif, shift, f.sign);
+    f.signif = u128_shift_right_round(f.signif, shift, f.sign);
     f.exp += shift;
     return f;
 }
@@ -132,7 +132,7 @@ static float80 f80_normalize(float80 f) {
     return f80_shift_left(f, shift);
 }
 
-static float80 u128_normalize_round(unsigned __int128 signif, int exp, int sign) {
+static float80 u128_normalize_round(uint128_t signif, int exp, int sign) {
     // correctly counting leading zeros on a 128-bit int is interesting
     int shift = __builtin_clzl((uint64_t) (signif >> 64));
     if (signif >> 64 == 0)
@@ -141,7 +141,10 @@ static float80 u128_normalize_round(unsigned __int128 signif, int exp, int sign)
         shift = 128;
     // now shift left
     if (exp - shift < unbias(EXP_MIN)) {
-        signif <<= exp - unbias(EXP_MIN);
+        if (exp > unbias(EXP_MIN))
+            signif <<= exp - unbias(EXP_MIN);
+        else
+            signif >>= unbias(EXP_MIN) - exp;
         exp = unbias(EXP_DENORMAL);
     } else {
         signif <<= shift;
@@ -153,7 +156,13 @@ static float80 u128_normalize_round(unsigned __int128 signif, int exp, int sign)
     // FIXME if signif is 0xffffffffffffffff0000000000000000,
     // u128_shift_right_round will return 0x10000000000000000, which would then
     // get truncated to 0
-    f.signif = u128_shift_right_round(signif, 64, sign);
+    // hack around cases where u128_shift_right_round returns 0x10000000000000000
+    signif = u128_shift_right_round(signif, 64, sign);
+    if (signif >> 64 != 0) {
+        signif >>= 1;
+        f.exp++;
+    }
+    f.signif = signif;
     f.sign = sign;
     return f;
 }
@@ -288,47 +297,46 @@ float80 f80_add(float80 a, float80 b) {
     // now either both are positive (addition) or a is positive and b is
     // negative (subtraction)
 
+    // do the addition in insane precision to fix that bug with adding 2^64 and 1.5
+    uint128_t a_signif = (uint128_t) a.signif << 64;
+    uint128_t b_signif = (uint128_t) b.signif << 64;
     // shift b (smaller exponent) right until the exponents are equal
-    float80 orig_b = b;
-    b = f80_shift_right(b, a.exp - b.exp);
-    assert(a.exp == b.exp);
+    b_signif = u128_shift_right_round(b_signif, a.exp - b.exp, a.sign);
 
-    float80 f = {.exp = a.exp};
+    int sign = a.sign;
+    int exp = unbias_denormal(a.exp);
+    uint128_t signif = a_signif;
     if (!b.sign) {
         // b is postive, so add
-        if (__builtin_uaddl_overflow(a.signif, b.signif, &f.signif)) {
-            // overflow, shift right by 1 place and set the cursed bit (which the overflow is into)
-            // skip the shift if the exponent is special
-            if (f.exp != EXP_SPECIAL)
-                f = f80_shift_right(f, 1);
-            f.signif |= CURSED_BIT;
+        if (!f80_isinf(a)) {
+            if (__builtin_add_overflow(a_signif, b_signif, &signif)) {
+                // in case of overflow, lose 1 bit of precision
+                signif = u128_shift_right_round(signif, 1, sign);
+                signif |= (uint128_t) 1 << 127; // recover the bit lost by the overflow
+                exp++;
+            }
         }
     } else {
         // b is negative, so subtract
 
         // infinity - infinity is indefinite, not zero
-        if (f80_isinf(a) && f80_isinf(orig_b))
+        if (f80_isinf(a) && f80_isinf(b))
             return F80_NAN;
 
-        if (a.signif >= b.signif) {
+        if (a_signif >= b_signif) {
             // we can subtract without underflow
-            f.signif = a.signif - b.signif;
+            signif = a_signif - b_signif;
         } else {
             // the answer will be negative
-            f.signif = b.signif - a.signif;
-            f.sign = 1;
+            signif = b_signif - a_signif;
+            sign = 1;
         }
 
-        if (f.signif == 0) {
-            f.exp = 0;
-            // only way to get negative zero would be from -0 + -0, which is
-            // handled by the other case
-            // so skip the flip
-            return f;
-        }
-        f = f80_normalize(f);
+        if (signif == 0)
+            return (float80) {0};
     }
 
+    float80 f = u128_normalize_round(signif, exp, sign);
     if (flipped)
         f.sign = ~f.sign;
     assert(f80_is_supported(f));
@@ -359,7 +367,7 @@ float80 f80_mul(float80 a, float80 b) {
     // add exponents (the +1 is necessary to be correct in 128-bit precision)
     int f_exp = unbias_denormal(a.exp) + unbias_denormal(b.exp) + 1;
     // multiply significands
-    unsigned __int128 f_signif = (unsigned __int128) a.signif * b.signif;
+    uint128_t f_signif = (uint128_t) a.signif * b.signif;
     // normalize and round the 128-bit result
     float80 f = u128_normalize_round(f_signif, f_exp, a.sign ^ b.sign);
     // xor signs
@@ -394,7 +402,7 @@ float80 f80_div(float80 a, float80 b) {
             f = F80_NAN;
     } else {
         int b_trailing = __builtin_ctzl(b.signif);
-        unsigned __int128 signif = ((unsigned __int128) a.signif << 64) / (b.signif >> b_trailing);
+        uint128_t signif = ((uint128_t) a.signif << 64) / (b.signif >> b_trailing);
         int exp = unbias_denormal(a.exp) - unbias_denormal(b.exp) + 63 - b_trailing;
         f = u128_normalize_round(signif, exp, a.sign ^ b.sign);
     }
@@ -452,6 +460,8 @@ float80 f80_log2(float80 x) {
     float80 zero = f80_from_int(0);
     float80 one = f80_from_int(1);
     float80 two = f80_from_int(2);
+    if (f80_isnan(x) || f80_lte(x, zero))
+        return F80_NAN;
 
     int ipart = 0;
     while (f80_lt(x, one)) {
@@ -470,7 +480,10 @@ float80 f80_log2(float80 x) {
             x = f80_mul(x, x);
             bit = f80_div(bit, two);
         }
+        float80 oldres = res;
         res = f80_add(res, bit);
+        if (oldres.signif == res.signif && oldres.exp == res.exp && oldres.sign == res.sign)
+            break;
         x = f80_div(x, two);
     }
     return res;
@@ -482,7 +495,7 @@ float80 f80_sqrt(float80 x) {
     // for a rough guess, just cut the exponent by 2
     float80 guess = x;
     guess.exp = bias(unbias(guess.exp) / 2);
-    // now converge on the answer, using what newton's method
+    // now converge on the answer, using newton's method
     float80 old_guess;
     float80 two = f80_from_int(2);
     int i = 0;
@@ -491,4 +504,10 @@ float80 f80_sqrt(float80 x) {
         guess = f80_div(f80_add(guess, f80_div(x, guess)), two);
     } while (!f80_eq(guess, old_guess) && i++ < 100);
     return guess;
+}
+
+float80 f80_scale(float80 x, int scale) {
+    if (!f80_is_supported(x) || f80_isnan(x))
+        return F80_NAN;
+    return u128_normalize_round((uint128_t) x.signif << 64, unbias(x.exp) + scale, x.sign);
 }

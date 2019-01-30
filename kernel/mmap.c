@@ -4,6 +4,44 @@
 #include "kernel/task.h"
 #include "fs/fd.h"
 #include "emu/memory.h"
+#include "kernel/mm.h"
+
+struct mm *mm_new() {
+    struct mm *mm = malloc(sizeof(struct mm));
+    if (mm == NULL)
+        return NULL;
+    mem_init(&mm->mem);
+    mm->start_brk = mm->brk = 0; // should get overwritten by exec
+    mm->exefile = NULL;
+    mm->refcount = 1;
+    return mm;
+}
+
+struct mm *mm_copy(struct mm *mm) {
+    struct mm *new_mm = malloc(sizeof(struct mm));
+    if (new_mm == NULL)
+        return NULL;
+    *new_mm = *mm;
+    mem_init(&new_mm->mem);
+    fd_retain(new_mm->exefile);
+    read_wrlock(&mm->mem.lock);
+    pt_copy_on_write(&mm->mem, 0, &new_mm->mem, 0, MEM_PAGES);
+    read_wrunlock(&mm->mem.lock);
+    return new_mm;
+}
+
+void mm_retain(struct mm *mm) {
+    mm->refcount++;
+}
+
+void mm_release(struct mm *mm) {
+    if (--mm->refcount == 0) {
+        if (mm->exefile != NULL)
+            fd_close(mm->exefile);
+        mem_destroy(&mm->mem);
+        free(mm);
+    }
+}
 
 static addr_t do_mmap(addr_t addr, dword_t len, dword_t prot, dword_t flags, fd_t fd_no, dword_t offset) {
     int err;
@@ -97,9 +135,13 @@ int_t sys_mremap(addr_t addr, dword_t old_len, dword_t new_len, dword_t flags) {
         return addr;
     }
 
-    dword_t pt_flags = current->mem->pt[PAGE(addr)].flags;
+    struct pt_entry *entry = mem_pt(current->mem, PAGE(addr));
+    if (entry == NULL)
+        return _EFAULT;
+    dword_t pt_flags = entry->flags;
     for (page_t page = PAGE(addr); page < PAGE(addr) + old_pages; page++) {
-        if (current->mem->pt[page].flags != pt_flags)
+        entry = mem_pt(current->mem, page);
+        if (entry == NULL && entry->flags != pt_flags)
             return _EFAULT;
     }
     if (!(pt_flags & P_ANON)) {
@@ -110,7 +152,10 @@ int_t sys_mremap(addr_t addr, dword_t old_len, dword_t new_len, dword_t flags) {
     pages_t extra_pages = new_pages - old_pages;
     if (!pt_is_hole(current->mem, extra_start, extra_pages))
         return _ENOMEM;
-    return pt_map_nothing(current->mem, extra_start, extra_pages, pt_flags);
+    int err = pt_map_nothing(current->mem, extra_start, extra_pages, pt_flags);
+    if (err < 0)
+        return err;
+    return addr;
 }
 
 int_t sys_mprotect(addr_t addr, uint_t len, int_t prot) {
@@ -126,41 +171,50 @@ int_t sys_mprotect(addr_t addr, uint_t len, int_t prot) {
     return err;
 }
 
-dword_t sys_madvise(addr_t addr, dword_t len, dword_t advice) {
+dword_t sys_madvise(addr_t UNUSED(addr), dword_t UNUSED(len), dword_t UNUSED(advice)) {
     // portable applications should not rely on linux's destructive semantics for MADV_DONTNEED.
+    return 0;
+}
+
+dword_t sys_mbind(addr_t UNUSED(addr), dword_t UNUSED(len), int_t UNUSED(mode),
+        addr_t UNUSED(nodemask), dword_t UNUSED(maxnode), uint_t UNUSED(flags)) {
+    return 0;
+}
+
+int_t sys_mlock(addr_t UNUSED(addr), dword_t UNUSED(len)) {
     return 0;
 }
 
 addr_t sys_brk(addr_t new_brk) {
     STRACE("brk(0x%x)", new_brk);
-    struct mem *mem = current->mem;
+    struct mm *mm = current->mm;
 
-    if (new_brk != 0 && new_brk < mem->start_brk)
+    if (new_brk != 0 && new_brk < mm->start_brk)
         return _EINVAL;
-    write_wrlock(&mem->lock);
-    addr_t old_brk = mem->brk;
+    write_wrlock(&mm->mem.lock);
+    addr_t old_brk = mm->brk;
     if (new_brk == 0) {
-        write_wrunlock(&mem->lock);
+        write_wrunlock(&mm->mem.lock);
         return old_brk;
     }
     // TODO check for not going too high
 
     if (new_brk > old_brk) {
         // expand heap: map region from old_brk to new_brk
-        int err = pt_map_nothing(mem, PAGE_ROUND_UP(old_brk),
+        int err = pt_map_nothing(&mm->mem, PAGE_ROUND_UP(old_brk),
                 PAGE_ROUND_UP(new_brk) - PAGE_ROUND_UP(old_brk), P_WRITE);
         if (err < 0) {
-            write_wrunlock(&mem->lock);
+            write_wrunlock(&mm->mem.lock);
             return err;
         }
     } else if (new_brk < old_brk) {
         // shrink heap: unmap region from new_brk to old_brk
         // first page to unmap is PAGE(new_brk)
         // last page to unmap is PAGE(old_brk)
-        pt_unmap(mem, PAGE(new_brk), PAGE(old_brk), PT_FORCE);
+        pt_unmap(&mm->mem, PAGE(new_brk), PAGE(old_brk), PT_FORCE);
     }
 
-    mem->brk = new_brk;
-    write_wrunlock(&mem->lock);
+    mm->brk = new_brk;
+    write_wrunlock(&mm->mem.lock);
     return new_brk;
 }

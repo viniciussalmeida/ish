@@ -127,7 +127,7 @@ static int compare_cpus(struct cpu_state *cpu, struct tlb *tlb, int pid, int und
         trycall(lseek(fd, dirty_page, SEEK_SET), "compare seek mem");
         trycall(read(fd, real_page, PAGE_SIZE), "compare read mem");
         close(fd);
-        struct pt_entry entry = cpu->mem->pt[PAGE(dirty_page)];
+        struct pt_entry entry = *mem_pt(cpu->mem, PAGE(dirty_page));
         void *fake_page = entry.data->data + entry.offset;
 
         if (memcmp(real_page, fake_page, PAGE_SIZE) != 0) {
@@ -310,7 +310,7 @@ static void step_tracing(struct cpu_state *cpu, struct tlb *tlb, int pid, int se
             case 54: { // ioctl (god help us)
                 struct fd *fd = f_get(cpu->ebx);
                 if (fd && fd->ops->ioctl_size) {
-                    ssize_t ioctl_size = fd->ops->ioctl_size(fd, cpu->ecx);
+                    ssize_t ioctl_size = fd->ops->ioctl_size(cpu->ecx);
                     if (ioctl_size >= 0)
                         pt_copy(pid, regs.rdx, ioctl_size);
                 }
@@ -359,20 +359,22 @@ static void step_tracing(struct cpu_state *cpu, struct tlb *tlb, int pid, int se
                 pt_copy(pid, regs.rbx, sizeof(struct pollfd_) * regs.rcx); break;
             case 183: // getcwd
                 pt_copy(pid, regs.rbx, cpu->eax); break;
-
             case 195: // stat64
             case 196: // lstat64
             case 197: // fstat64
                 pt_copy(pid, regs.rcx, sizeof(struct newstat64)); break;
-            case 300: // fstatat64
-                pt_copy(pid, regs.rdx, sizeof(struct newstat64)); break;
             case 220: // getdents64
                 pt_copy(pid, regs.rcx, cpu->eax); break;
+            case 242: // sched_getaffinity
+                pt_copy(pid, regs.rdx, regs.rcx); break;
             case 265: // clock_gettime
                 pt_copy(pid, regs.rcx, sizeof(struct timespec_)); break;
-	    case 340: // prlimit
-		if (regs.rsi != 0) pt_copy(pid, regs.rsi, sizeof(struct rlimit_)); break;
-
+            case 300: // fstatat64
+                pt_copy(pid, regs.rdx, sizeof(struct newstat64)); break;
+            case 305: // readlinkat
+                if (cpu->eax < 0xffff000) pt_copy(pid, regs.rdx, cpu->eax); break;
+            case 340: // prlimit
+                if (regs.rsi != 0) pt_copy(pid, regs.rsi, sizeof(struct rlimit_)); break;
             case 355: // getrandom
                 pt_copy(pid, regs.rbx, regs.rcx); break;
 
@@ -393,6 +395,7 @@ static void step_tracing(struct cpu_state *cpu, struct tlb *tlb, int pid, int se
             case 174: // rt_sigaction
             case 175: // rt_sigprocmask
             case 243: // set_thread_area
+                //regs.rax = cpu->eax;
                 goto do_step;
         }
         regs.rax = cpu->eax;
@@ -454,7 +457,10 @@ static void prepare_tracee(int pid) {
 }
 
 int main(int argc, char *const argv[]) {
-    int err = xX_main_Xx(argc, argv, NULL);
+    char *const *envp = NULL;
+    if (getenv("TERM"))
+        envp = (char *[]) {getenv("TERM") - strlen("TERM") - 1, NULL};
+    int err = xX_main_Xx(argc, argv, envp);
     if (err < 0) {
         fprintf(stderr, "%s\n", strerror(-err));
         return err;
@@ -480,12 +486,11 @@ int main(int argc, char *const argv[]) {
     struct cpu_state old_cpu = *cpu;
     int i = 0;
     while (true) {
-        if (compare_cpus(cpu, &tlb, pid, undefined_flags) < 0) {
+        while (compare_cpus(cpu, &tlb, pid, undefined_flags) < 0) {
             printk("failure: resetting cpu\n");
             *cpu = old_cpu;
             __asm__("int3");
             cpu_step32(cpu, &tlb);
-            return -1;
         }
         undefined_flags = undefined_flags_mask(cpu, &tlb);
         old_cpu = *cpu;

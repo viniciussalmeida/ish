@@ -12,8 +12,7 @@ static void gen(struct gen_state *state, unsigned long thing) {
         struct jit_block *bigger_block = realloc(state->block,
                 sizeof(struct jit_block) + state->capacity * sizeof(unsigned long));
         if (bigger_block == NULL) {
-            printk("out of memory while jitting");
-            abort();
+            die("out of memory while jitting");
         }
         state->block = bigger_block;
     }
@@ -72,8 +71,6 @@ void gen_exit(struct gen_state *state) {
 
 #define FINISH \
     return !end_block
-
-#define TRACEIP() TRACE("%d %08x\t", current->pid, state->ip);
 
 #define _READIMM(name, size) \
     if (!tlb_read(tlb, state->ip, &name, size/8)) SEGFAULT; \
@@ -282,6 +279,8 @@ static inline bool gen_op(struct gen_state *state, gadget_t *gadgets, enum arg a
 
 #define ROL(count, val,z) los(rol, count, val, z)
 #define ROR(count, val,z) los(ror, count, val, z)
+#define RCL(count, val,z) los(rcl, count, val, z)
+#define RCR(count, val,z) los(rcr, count, val, z)
 #define SHL(count, val,z) los(shl, count, val, z)
 #define SHR(count, val,z) los(shr, count, val, z)
 #define SAR(count, val,z) los(sar, count, val, z)
@@ -298,9 +297,9 @@ static inline bool gen_op(struct gen_state *state, gadget_t *gadgets, enum arg a
     store(dst,z)
 
 #define BT(bit, val,z) lo(bt, val, bit, z)
-#define BTC(bit, val,z) UNDEFINED
-#define BTS(bit, val,z) UNDEFINED
-#define BTR(bit, val,z) UNDEFINED
+#define BTC(bit, val,z) lo(btc, val, bit, z)
+#define BTS(bit, val,z) lo(bts, val, bit, z)
+#define BTR(bit, val,z) lo(btr, val, bit, z)
 #define BSF(src, dst,z) los(bsf, src, dst, z)
 #define BSR(src, dst,z) los(bsr, src, dst, z)
 
@@ -320,8 +319,6 @@ void helper_rdtsc(struct cpu_state *cpu);
 #define CPUID() g(cpuid)
 
 // atomic
-// TODO the gadgets currently don't exist on arm
-#if defined(__x86_64__)
 #define atomic_op(type, src, dst,z) load(src, z); op(atomic_##type, dst, z)
 #define ATOMIC_ADD(src, dst,z) atomic_op(add, src, dst, z)
 #define ATOMIC_OR(src, dst,z) atomic_op(or, src, dst, z)
@@ -334,20 +331,6 @@ void helper_rdtsc(struct cpu_state *cpu);
 #define ATOMIC_DEC(val,z) op(atomic_dec, val, z)
 #define ATOMIC_CMPXCHG(src, dst,z) atomic_op(cmpxchg, src, dst, z)
 #define ATOMIC_XADD(src, dst,z) load(src, z); op(atomic_xadd, dst, z); store(src, z)
-
-#else
-#define ATOMIC_ADD ADD
-#define ATOMIC_OR OR
-#define ATOMIC_ADC ADC
-#define ATOMIC_SBB SBB
-#define ATOMIC_AND AND
-#define ATOMIC_SUB SUB
-#define ATOMIC_XOR XOR
-#define ATOMIC_INC INC
-#define ATOMIC_DEC DEC
-#define ATOMIC_CMPXCHG CMPXCHG
-#define ATOMIC_XADD XADD
-#endif
 
 // sse
 #define XORP(src, dst) UNDEFINED
@@ -373,12 +356,15 @@ void helper_rdtsc(struct cpu_state *cpu);
 #define FUCOM() hh(fpu_ucom, st_i)
 #define FUCOMI() hh(fpu_ucomi, st_i)
 #define FCOMI() hh(fpu_comi, st_i)
+#define FTST() h(fpu_tst)
+#define FXAM() h(fpu_xam)
 #define FST() hh(fpu_st, st_i)
 #define FCHS() h(fpu_chs)
 #define FABS() h(fpu_abs)
 #define FLDC(what) hh(fpu_ldc, fconst_##what)
 #define FPREM() h(fpu_prem)
 #define FRNDINT() h(fpu_rndint)
+#define FSCALE() h(fpu_scale)
 #define FSQRT() h(fpu_sqrt)
 #define FYL2X() h(fpu_yl2x)
 #define F2XM1() h(fpu_2xm1)
@@ -405,7 +391,6 @@ void helper_rdtsc(struct cpu_state *cpu);
 #define FIDIVR(val,z) h_read(fpu_idivr, z)
 #define FDIVRM(val,z) h_read(fpu_divrm, z)
 #define FPATAN() h(fpu_patan)
-#define FXAM() h(fpu_xam)
 
 #define DECODER_RET int
 #define DECODER_NAME gen_step

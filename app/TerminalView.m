@@ -6,41 +6,15 @@
 //
 
 #import "TerminalView.h"
+#import "UserPreferences.h"
 
 @interface TerminalView ()
 
-typedef enum {
-    kNone,
-    kEsc,
-    kCtrl,
-} CapsLockTarget;
-
-
 @property (nonatomic) NSMutableArray<UIKeyCommand *> *keyCommands;
-@property (nonatomic) CapsLockTarget currentCapsLocktarget;
 
 @end
 
 @implementation TerminalView
-
-- (void)registerExternalKeyboardNotificationsToNotificationCenter:(NSNotificationCenter *)center {
-    [center addObserver:self
-               selector:@selector(keyboardDidChange:)
-                   name:UITextInputCurrentInputModeDidChangeNotification
-                 object:nil];
-    [center addObserver:self
-               selector:@selector(appDidBecomeActive:)
-                   name:UIApplicationDidBecomeActiveNotification
-                 object:nil];
-}
-
-- (void)keyboardDidChange:(NSNotification *)notification {
-    self.currentCapsLocktarget = [self capsLockTarget];
-}
-
-- (void)appDidBecomeActive:(NSNotification *)notification {
-    self.currentCapsLocktarget = [self capsLockTarget];
-}
 
 - (void)setTerminal:(Terminal *)terminal {
     if (self.terminal) {
@@ -117,11 +91,35 @@ typedef enum {
     [self.terminal sendInput:data.bytes length:data.length];
 }
 
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    if ([NSStringFromSelector(action) hasPrefix:@"_accessibility"] && [self.terminal.webView canPerformAction:action withSender:sender])
+        return YES;
+    return [super canPerformAction:action withSender:sender];
+}
+
 - (void)paste:(id)sender {
     NSString *string = UIPasteboard.generalPasteboard.string;
     if (string) {
         [self insertText:string];
     }
+}
+
+- (void)copy:(id)sender {
+    [self.terminal.webView evaluateJavaScript:@"window.getSelection().toString()" completionHandler:^(NSString *selection, NSError *err) {
+        if (err != nil) {
+            NSLog(@"error copying: %@", err);
+            return;
+        }
+        // xterm uses nonbreaking spaces for no apparent reason
+        selection = [selection stringByReplacingOccurrencesOfString:@"\u00a0" withString:@" "];
+        UIPasteboard.generalPasteboard.string = selection;
+    }];
+}
+
+- (id)forwardingTargetForSelector:(SEL)selector {
+    if ([NSStringFromSelector(selector) hasPrefix:@"_accessibility"])
+        return self.terminal.webView;
+    return nil;
 }
 
 - (void)deleteBackward {
@@ -130,6 +128,10 @@ typedef enum {
 
 - (BOOL)hasText {
     return YES; // it's always ok to send a "delete"
+}
+
+- (void)clearScreen:(UIKeyCommand *)command {
+    [self.terminal.webView evaluateJavaScript:@"term.clear()" completionHandler:nil];
 }
 
 - (UITextSmartDashesType)smartDashesType API_AVAILABLE(ios(11)) {
@@ -156,13 +158,13 @@ typedef enum {
         if ([key isEqualToString:UIKeyInputEscape])
             key = @"\x1b";
         else if ([key isEqualToString:UIKeyInputUpArrow])
-            key = @"\x1b[A";
+            key = [self.terminal arrow:'A'];
         else if ([key isEqualToString:UIKeyInputDownArrow])
-            key = @"\x1b[B";
+            key = [self.terminal arrow:'B'];
         else if ([key isEqualToString:UIKeyInputLeftArrow])
-            key = @"\x1b[D";
+            key = [self.terminal arrow:'D'];
         else if ([key isEqualToString:UIKeyInputRightArrow])
-            key = @"\x1b[C";
+            key = [self.terminal arrow:'C'];
         [self insertText:key];
     } else if (command.modifierFlags & UIKeyModifierShift) {
         [self insertText:[key uppercaseString]];
@@ -184,11 +186,6 @@ typedef enum {
 
 static const char *alphabet = "abcdefghijklmnopqrstuvwxyz";
 static const char *controlKeys = "abcdefghijklmnopqrstuvwxyz26-=[]\\";
-NSString *kiSHCapsLockMapping = @"kiSHCapsLockMapping";
-
-- (BOOL)shouldRemapCapsLock {
-    return self.currentCapsLocktarget != kNone;
-}
 
 - (NSArray<UIKeyCommand *> *)keyCommands {
     if (_keyCommands != nil)
@@ -199,12 +196,16 @@ NSString *kiSHCapsLockMapping = @"kiSHCapsLockMapping";
                                    UIKeyInputLeftArrow, UIKeyInputRightArrow, @"\t"]) {
         [self addKey:specialKey withModifiers:0];
     }
-    if ([self shouldRemapCapsLock]) {
+    if (UserPreferences.shared.capsLockMapping != CapsLockMapNone) {
         [self addKeys:controlKeys withModifiers:UIKeyModifierAlphaShift];
         [self addKeys:alphabet withModifiers:0];
         [self addKeys:alphabet withModifiers:UIKeyModifierShift];
         [self addKey:@"" withModifiers:UIKeyModifierAlphaShift]; // otherwise tap of caps lock can switch layouts
     }
+    [_keyCommands addObject:[UIKeyCommand keyCommandWithInput:@"k"
+                                                modifierFlags:UIKeyModifierCommand
+                                                       action:@selector(clearScreen:)
+                                         discoverabilityTitle:@"Clear Screen"]];
     return _keyCommands;
 }
 
@@ -222,16 +223,6 @@ NSString *kiSHCapsLockMapping = @"kiSHCapsLockMapping";
     
 }
 
-- (CapsLockTarget)capsLockTarget {
-    NSString *target = [[NSUserDefaults standardUserDefaults] stringForKey:kiSHCapsLockMapping];
-    if([target isEqualToString:@"esc"]) {
-        return kEsc;
-    } else if([target isEqualToString:@"ctrl"]) {
-        return kCtrl;
-    }
-    return kNone;
-}
-
 - (void)keyCommandTriggered:(UIKeyCommand *)sender {
     dispatch_async(dispatch_get_main_queue(), ^{
         [self handleKeyCommand:sender];
@@ -239,17 +230,16 @@ NSString *kiSHCapsLockMapping = @"kiSHCapsLockMapping";
 }
 
 - (void)handleCapsLockWithCommand:(UIKeyCommand *)command {
-    CapsLockTarget target = self.currentCapsLocktarget;
+    CapsLockMapping target = UserPreferences.shared.capsLockMapping;
     NSString *newInput = command.input ? command.input : @"";
     UIKeyModifierFlags flags = command.modifierFlags;
     flags ^= UIKeyModifierAlphaShift;
-    if(target == kEsc) {
+    if(target == CapsLockMapEscape) {
         newInput = UIKeyInputEscape;
-    } else if(target == kCtrl) {
+    } else if(target == CapsLockMapControl) {
         if([newInput length] == 0) {
             return;
         }
-
         flags |= UIKeyModifierControl;
     } else {
         return;

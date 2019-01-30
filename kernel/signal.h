@@ -56,10 +56,12 @@ struct sigaction_ {
 void send_signal(struct task *task, int sig);
 // send a signal without regard for whether the signal is blocked or ignored
 void deliver_signal(struct task *task, int sig);
-// send a signal to all processes in a group
-void send_group_signal(dword_t pgid, int sig);
-// check for and deliver pending signals on current, should be called from SIGUSR1 handler
-void receive_signals(void);
+// send a signal to all processes in a group, could return ESRCH
+int send_group_signal(dword_t pgid, int sig);
+// check for and deliver pending signals on current
+// returns whether signals were received
+// must be called without pids_lock
+bool receive_signals(void);
 
 struct sighand {
     atomic_uint refcount;
@@ -83,6 +85,7 @@ dword_t sys_rt_sigreturn(dword_t sig);
 typedef uint64_t sigset_t_;
 int do_sigprocmask(dword_t how, sigset_t_ set, sigset_t_ *oldset);
 dword_t sys_rt_sigprocmask(dword_t how, addr_t set, addr_t oldset, dword_t size);
+int_t sys_rt_sigpending(addr_t set_addr);
 
 struct stack_t_ {
     addr_t stack;
@@ -93,8 +96,10 @@ struct stack_t_ {
 #define SS_DISABLE_ 2
 dword_t sys_sigaltstack(addr_t ss, addr_t old_ss);
 
-dword_t sys_kill(dword_t pid, dword_t sig);
-dword_t sys_tkill(dword_t tid, dword_t sig);
+int_t sys_rt_sigsuspend(addr_t mask_addr, uint_t size);
+
+dword_t sys_kill(pid_t_ pid, dword_t sig);
+dword_t sys_tkill(pid_t_ tid, dword_t sig);
 
 // signal frame structs. There's a good chance this should go in its own header file
 
@@ -167,7 +172,7 @@ struct sigframe_ {
     dword_t sig;
     struct sigcontext_ sc;
     struct fpstate_ fpstate;
-    dword_t extramask[1];
+    dword_t extramask;
     struct {
         uint16_t popmov;
         dword_t nr_sigreturn;

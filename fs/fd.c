@@ -1,18 +1,28 @@
 #include <stdlib.h>
+#include <string.h>
+#include "debug.h"
 #include "kernel/task.h"
 #include "kernel/errno.h"
 #include "kernel/resource.h"
 #include "kernel/fs.h"
+#include "fs/poll.h"
 #include "fs/fd.h"
+#include "fs/inode.h"
 
-struct fd *fd_create() {
+struct fd *fd_create(const struct fd_ops *ops) {
     struct fd *fd = malloc(sizeof(struct fd));
+    if (fd == NULL)
+        return NULL;
     *fd = (struct fd) {};
+    fd->ops = ops;
     fd->refcount = 1;
     fd->flags = 0;
     fd->mount = NULL;
+    fd->offset = 0;
     list_init(&fd->poll_fds);
+    lock_init(&fd->poll_lock);
     lock_init(&fd->lock);
+    cond_init(&fd->cond);
     return fd;
 }
 
@@ -24,14 +34,37 @@ struct fd *fd_retain(struct fd *fd) {
 int fd_close(struct fd *fd) {
     int err = 0;
     if (--fd->refcount == 0) {
+        lock(&fd->poll_lock);
+        struct poll_fd *poll_fd, *tmp;
+        list_for_each_entry_safe(&fd->poll_fds, poll_fd, tmp, polls) {
+            lock(&poll_fd->poll->lock);
+            list_remove(&poll_fd->polls);
+            list_remove(&poll_fd->fds);
+            unlock(&poll_fd->poll->lock);
+            free(poll_fd);
+        }
+        unlock(&fd->poll_lock);
         if (fd->ops->close)
             err = fd->ops->close(fd);
+        // see comment in close in kernel/fs.h
+        if (fd->mount && fd->mount->fs->close && fd->mount->fs->close != fd->ops->close) {
+            int new_err = fd->mount->fs->close(fd);
+            if (new_err < 0)
+                err = new_err;
+        }
+
+        if (fd->inode)
+            inode_release(fd->inode);
+        if (fd->mount)
+            mount_release(fd->mount);
         free(fd);
     }
     return err;
 }
 
-struct fdtable *fdtable_new(unsigned size) {
+static int fdtable_resize(struct fdtable *table, int size);
+
+struct fdtable *fdtable_new(int size) {
     struct fdtable *fdt = malloc(sizeof(struct fdtable));
     if (fdt == NULL)
         return ERR_PTR(_ENOMEM);
@@ -39,6 +72,7 @@ struct fdtable *fdtable_new(unsigned size) {
     fdt->size = 0;
     fdt->files = NULL;
     fdt->cloexec = NULL;
+    lock_init(&fdt->lock);
     int err = fdtable_resize(fdt, size);
     if (err < 0) {
         free(fdt);
@@ -47,17 +81,24 @@ struct fdtable *fdtable_new(unsigned size) {
     return fdt;
 }
 
+static int fdtable_close(struct fdtable *table, fd_t f);
+
+// FIXME this looks like it has the classic refcount UAF
 void fdtable_release(struct fdtable *table) {
+    lock(&table->lock);
     if (--table->refcount == 0) {
         for (fd_t f = 0; f < table->size; f++)
-            f_close(f);
+            fdtable_close(table, f);
         free(table->files);
         free(table->cloexec);
+        unlock(&table->lock);
         free(table);
+    } else {
+        unlock(&table->lock);
     }
 }
 
-int fdtable_resize(struct fdtable *table, unsigned size) {
+static int fdtable_resize(struct fdtable *table, int size) {
     // currently the only legitimate use of this is to expand the table
     assert(size > table->size);
 
@@ -86,47 +127,47 @@ int fdtable_resize(struct fdtable *table, unsigned size) {
 }
 
 struct fdtable *fdtable_copy(struct fdtable *table) {
-    unsigned size = table->size;
+    lock(&table->lock);
+    int size = table->size;
     struct fdtable *new_table = fdtable_new(size);
-    if (IS_ERR(new_table))
+    if (IS_ERR(new_table)) {
+        unlock(&table->lock);
         return new_table;
+    }
     memcpy(new_table->files, table->files, sizeof(struct fd *) * size);
     for (fd_t f = 0; f < size; f++)
         if (new_table->files[f])
             new_table->files[f]->refcount++;
     memcpy(new_table->cloexec, table->cloexec, BITS_SIZE(size));
+    unlock(&table->lock);
     return new_table;
 }
 
-static inline bool f_in_range(fd_t f) {
-    return f < current->files->size;
-}
-
-struct fd *f_get(fd_t f) {
-    if (!f_in_range(f))
-        return NULL;
-    return current->files->files[f];
-}
-
-bool f_is_cloexec(fd_t f) {
-    return bit_test(f, current->files->cloexec);
-}
-void f_set_cloexec(fd_t f) {
-    bit_set(f, current->files->cloexec);
-}
-
 static int fdtable_expand(struct fdtable *table, fd_t max) {
-    unsigned size = max + 1;
+    int size = max + 1;
     if (table->size >= size)
         return 0;
-    if (size > rlimit(RLIMIT_NOFILE_))
+    if (size > (int) rlimit(RLIMIT_NOFILE_))
         return _EMFILE;
     return fdtable_resize(table, max + 1);
 }
 
+struct fd *fdtable_get(struct fdtable *table, fd_t f) {
+    if (f < 0 || f >= current->files->size)
+        return NULL;
+    return table->files[f];
+}
+
+struct fd *f_get(fd_t f) {
+    lock(&current->files->lock);
+    struct fd *fd = fdtable_get(current->files, f);
+    unlock(&current->files->lock);
+    return fd;
+}
+
 static fd_t f_install_start(struct fd *fd, fd_t start) {
     struct fdtable *table = current->files;
-    unsigned size = rlimit(RLIMIT_NOFILE_);
+    int size = rlimit(RLIMIT_NOFILE_);
     if (size > table->size)
         size = table->size;
 
@@ -143,18 +184,27 @@ static fd_t f_install_start(struct fd *fd, fd_t start) {
     if (f >= 0) {
         table->files[f] = fd;
         bit_clear(f, table->cloexec);
-    } else
+    } else {
         fd_close(fd);
+    }
     return f;
 }
 
-fd_t f_install(struct fd *fd) {
-    return f_install_start(fd, 0);
+fd_t f_install(struct fd *fd, int flags) {
+    lock(&current->files->lock);
+    fd_t f = f_install_start(fd, 0);
+    if (f >= 0) {
+        if (flags & O_CLOEXEC_)
+            bit_set(f, current->files->cloexec);
+        if (flags & O_NONBLOCK_)
+            fd->flags |= O_NONBLOCK_;
+    }
+    unlock(&current->files->lock);
+    return f;
 }
 
-int f_close(fd_t f) {
-    struct fdtable *table = current->files;
-    struct fd *fd = f_get(f);
+static int fdtable_close(struct fdtable *table, fd_t f) {
+    struct fd *fd = fdtable_get(table, f);
     if (fd == NULL)
         return _EBADF;
     int err = fd_close(fd);
@@ -163,9 +213,24 @@ int f_close(fd_t f) {
     return err;
 }
 
+int f_close(fd_t f) {
+    lock(&current->files->lock);
+    int err = fdtable_close(current->files, f);
+    unlock(&current->files->lock);
+    return err;
+}
+
 dword_t sys_close(fd_t f) {
     STRACE("close(%d)", f);
     return f_close(f);
+}
+
+void fdtable_do_cloexec(struct fdtable *table) {
+    lock(&table->lock);
+    for (fd_t f = 0; f < table->size; f++)
+        if (bit_test(f, table->cloexec))
+            fdtable_close(table, f);
+    unlock(&table->lock);
 }
 
 #define F_DUPFD_ 0
@@ -179,7 +244,7 @@ dword_t sys_dup(fd_t f) {
     if (fd == NULL)
         return _EBADF;
     fd->refcount++;
-    return f_install(fd);
+    return f_install(fd, 0);
 }
 
 dword_t sys_dup2(fd_t f, fd_t new_f) {
@@ -192,9 +257,22 @@ dword_t sys_dup2(fd_t f, fd_t new_f) {
     if (err < 0)
         return err;
     f_close(new_f);
-    fd->refcount++;
-    table->files[new_f] = fd;
+    table->files[new_f] = fd_retain(fd);
     return new_f;
+}
+
+int fd_getflags(struct fd *fd) {
+    if (fd->ops->getflags)
+        return fd->ops->getflags(fd);
+    return fd->flags;
+}
+
+#define FD_ALLOWED_FLAGS (O_APPEND_ | O_NONBLOCK_)
+int fd_setflags(struct fd *fd, int flags) {
+    if (fd->ops->setflags)
+        return fd->ops->setflags(fd, flags);
+    fd->flags = (fd->flags & ~FD_ALLOWED_FLAGS) | (flags & FD_ALLOWED_FLAGS);
+    return 0;
 }
 
 dword_t sys_fcntl64(fd_t f, dword_t cmd, dword_t arg) {
@@ -221,17 +299,10 @@ dword_t sys_fcntl64(fd_t f, dword_t cmd, dword_t arg) {
 
         case F_GETFL_:
             STRACE("fcntl(%d, F_GETFL)", f);
-            if (fd->ops->getflags == NULL)
-                return fd->flags;
-            return fd->ops->getflags(fd);
+            return fd_getflags(fd);
         case F_SETFL_:
             STRACE("fcntl(%d, F_SETFL, %#x)", f, arg);
-            if (fd->ops->setflags != NULL) {
-                arg &= O_APPEND_ | O_NONBLOCK_;
-                fd->flags = arg;
-                return 0;
-            }
-            return fd->ops->setflags(fd, arg);
+            return fd_setflags(fd, arg);
 
         default:
             STRACE("fcntl(%d, %d)", f, cmd);

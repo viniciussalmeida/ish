@@ -3,9 +3,11 @@
 
 #include <pthread.h>
 #include "emu/cpu.h"
+#include "kernel/mm.h"
 #include "kernel/fs.h"
 #include "kernel/signal.h"
 #include "kernel/resource.h"
+#include "fs/sockrestart.h"
 #include "util/list.h"
 #include "util/timer.h"
 #include "util/sync.h"
@@ -14,8 +16,10 @@
 // locking, unless otherwise specified
 struct task {
     struct cpu_state cpu;
-    struct mem *mem;
+    struct mm *mm;
+    struct mem *mem; // copy of cpu.mem, for convenience
     pthread_t thread;
+    uint64_t threadid;
 
     struct tgroup *group; // immutable
     struct list group_links;
@@ -23,6 +27,10 @@ struct task {
     uid_t_ uid, gid;
     uid_t_ euid, egid;
     uid_t_ suid, sgid;
+#define MAX_GROUPS 32
+    unsigned ngroups;
+    uid_t_ groups[MAX_GROUPS];
+    char comm[16];
     bool did_exec; // for that one annoying setsid edge case
 
     struct fdtable *files;
@@ -32,25 +40,32 @@ struct task {
     sigset_t_ blocked;
     sigset_t_ queued; // where blocked signals go when they're sent
     sigset_t_ pending;
+    cond_t pause; // please don't signal this
 
     // locked by pids_lock
     struct task *parent;
     struct list children;
     struct list siblings;
-    pid_t_ sid, pgid;
-    struct list session;
-    struct list pgroup;
 
     addr_t clear_tid;
 
-    // locked by parent's thread group
+    // locked by pids_lock
     dword_t exit_code;
     bool zombie;
 
-    // I wish conditions variables were as reliable as wait queues. alas, they are not
-    bool vfork_done;
-    cond_t vfork_cond;
-    lock_t vfork_lock;
+    // this structure is allocated on the stack of the parent's clone() call
+    struct vfork_info {
+        bool done;
+        cond_t cond;
+        lock_t lock;
+    } *vfork;
+    int exit_signal;
+
+    // lock for anything that needs locking but is not covered by some other lock
+    // right now, just comm
+    lock_t general_lock;
+
+    struct task_sockrestart sockrestart;
 
     // current condition/lock, so it can be notified in case of a signal
     cond_t *waiting_cond;
@@ -77,9 +92,15 @@ struct tgroup {
     struct task *leader; // immutable
     struct rusage_ rusage;
 
-    struct tty *tty;
+    // locked by pids_lock
+    pid_t_ sid, pgid;
+    struct list session;
+    struct list pgroup;
 
-    bool has_timer;
+    bool stopped;
+    cond_t stopped_cond;
+
+    struct tty *tty;
     struct timer *timer;
 
     struct rlimit_ limits[RLIMIT_NLIMITS_];
@@ -92,6 +113,7 @@ struct tgroup {
     struct rusage_ children_rusage;
     cond_t child_exit;
 
+    // for everything in this struct not locked by something else
     lock_t lock;
 };
 
@@ -121,5 +143,7 @@ extern void (*task_run_hook)(void);
 void task_start(struct task *task);
 
 extern void (*exit_hook)(int code);
+
+#define superuser() (current->euid == 0)
 
 #endif

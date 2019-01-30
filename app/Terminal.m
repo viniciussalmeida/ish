@@ -8,6 +8,7 @@
 #include <iconv.h>
 #import "Terminal.h"
 #import "DelayedUITask.h"
+#import "UserPreferences.h"
 #include "fs/tty.h"
 
 @interface Terminal () <WKScriptMessageHandler>
@@ -19,6 +20,16 @@
 @property DelayedUITask *refreshTask;
 @property DelayedUITask *scrollToBottomTask;
 
+@property BOOL applicationCursor;
+
+@end
+
+@interface CustomWebView : WKWebView
+@end
+@implementation CustomWebView
+- (BOOL)becomeFirstResponder {
+    return NO;
+}
 @end
 
 @implementation Terminal
@@ -36,13 +47,14 @@ static Terminal *terminal = nil;
         WKWebViewConfiguration *config = [WKWebViewConfiguration new];
         [config.userContentController addScriptMessageHandler:self name:@"log"];
         [config.userContentController addScriptMessageHandler:self name:@"resize"];
-        [config.userContentController addScriptMessageHandler:self name:@"selectionchange"];
-        self.webView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:config];
+        [config.userContentController addScriptMessageHandler:self name:@"propUpdate"];
+        self.webView = [[CustomWebView alloc] initWithFrame:CGRectZero configuration:config];
         self.webView.scrollView.scrollEnabled = NO;
         [self.webView loadRequest:
          [NSURLRequest requestWithURL:
           [NSBundle.mainBundle URLForResource:@"xterm-dist/term" withExtension:@"html"]]];
         [self.webView addObserver:self forKeyPath:@"loading" options:0 context:NULL];
+        [self _addPreferenceObservers];
         terminal = self;
     }
     return self;
@@ -58,35 +70,34 @@ static Terminal *terminal = nil;
         NSLog(@"%@", message.body);
     } else if ([message.name isEqualToString:@"resize"]) {
         [self syncWindowSize];
+    } else if ([message.name isEqualToString:@"propUpdate"]) {
+        [self setValue:message.body[1] forKey:message.body[0]];
     }
 }
 
 - (void)syncWindowSize {
-    NSLog(@"syncing");
     [self.webView evaluateJavaScript:@"[term.cols, term.rows]" completionHandler:^(NSArray<NSNumber *> *dimensions, NSError *error) {
         if (self.tty == NULL) {
-            NSLog(@"gave up");
             return;
         }
         int cols = dimensions[0].intValue;
         int rows = dimensions[1].intValue;
-        NSLog(@"%dx%d", cols, rows);
         lock(&self.tty->lock);
         tty_set_winsize(self.tty, (struct winsize_) {.col = cols, .row = rows});
         unlock(&self.tty->lock);
     }];
 }
 
-- (size_t)write:(const void *)buf length:(size_t)len {
+- (int)write:(const void *)buf length:(size_t)len {
     @synchronized (self) {
         [self.pendingData appendData:[NSData dataWithBytes:buf length:len]];
         [self.refreshTask schedule];
     }
-    return len;
+    return 0;
 }
 
 - (void)sendInput:(const char *)buf length:(size_t)len {
-    tty_input(self.tty, buf, len);
+    tty_input(self.tty, buf, len, 0);
     [self.scrollToBottomTask schedule];
 }
 
@@ -94,26 +105,101 @@ static Terminal *terminal = nil;
     [self.webView evaluateJavaScript:@"term.scrollToBottom()" completionHandler:nil];
 }
 
+- (NSString *)arrow:(char)direction {
+    return [NSString stringWithFormat:@"\x1b%c%c", self.applicationCursor ? 'O' : '[', direction];
+}
+
+- (void)_addPreferenceObservers {
+    UserPreferences *prefs = [UserPreferences shared];
+    NSKeyValueObservingOptions opts = NSKeyValueObservingOptionNew;
+    [prefs addObserver:self forKeyPath:@"fontSize" options:opts context:nil];
+    [prefs addObserver:self forKeyPath:@"theme" options:opts context:nil];
+}
+
+- (NSString *)cssColor:(UIColor *)color {
+    CGFloat red, green, blue, alpha;
+    [color getRed:&red green:&green blue:&blue alpha:&alpha];
+    return [NSString stringWithFormat:@"rgba(%ld, %ld, %ld, %ld)",
+            lround(red * 255), lround(green * 255), lround(blue * 255), lround(alpha * 255)];
+}
+
+- (void)_updateStyleFromPreferences {
+    UserPreferences *prefs = [UserPreferences shared];
+    id themeInfo = @{
+                     @"fontSize": prefs.fontSize,
+                     @"foregroundColor": [self cssColor:prefs.theme.foregroundColor],
+                     @"backgroundColor": [self cssColor:prefs.theme.backgroundColor],
+                     };
+    NSString *json = [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:themeInfo options:0 error:nil] encoding:NSUTF8StringEncoding];
+    [self.webView evaluateJavaScript:[NSString stringWithFormat:@"updateStyle(%@)", json] completionHandler:nil];
+}
+
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary<NSKeyValueChangeKey,id> *)change context:(void *)context {
     if (object == self.webView && [keyPath isEqualToString:@"loading"] && !self.webView.loading) {
+        [self _updateStyleFromPreferences];
         [self.refreshTask schedule];
         [self.webView removeObserver:self forKeyPath:@"loading"];
+    } else if (object == [UserPreferences shared]) {
+        [self _updateStyleFromPreferences];
     }
 }
 
 NSData *removeInvalidUTF8(NSData *data) {
-    // character encoding hell
+    static const uint32_t mins[4] = {0, 128, 2048, 65536};
     NSMutableData *cleanData = [NSMutableData dataWithLength:data.length];
-    iconv_t conv = iconv_open("UTF-8", "UTF-8");
-    BOOL yes = YES;
-    iconvctl(conv, ICONV_SET_DISCARD_ILSEQ, &yes);
-    const char *dataBytes = data.bytes;
-    char *cleanDataBytes = cleanData.mutableBytes;
-    size_t dataLength = data.length;
-    size_t cleanDataLength = cleanData.length;
-    iconv(conv, (char **) &dataBytes, &dataLength, &cleanDataBytes, &cleanDataLength);
-    iconv_close(conv);
-    cleanData.length -= cleanDataLength;
+    const uint8_t *bytes = data.bytes;
+    uint8_t *clean_bytes = cleanData.mutableBytes;
+    size_t clean_length = 0;
+    size_t clean_i = 0;
+    unsigned continuations = 0;
+    uint32_t c = 0;
+    uint32_t min_c = 0;
+    for (size_t i = 0; i < data.length; i++) {
+        if (bytes[i] >> 6 != 0b10) {
+            // start of new sequence
+            if (continuations != 0)
+                goto discard;
+            if (bytes[i] >> 7 == 0b0) {
+                continuations = 0;
+                c = bytes[i] & 0b1111111;
+            } else if (bytes[i] >> 5 == 0b110) {
+                continuations = 1;
+                c = bytes[i] & 0b11111;
+            } else if (bytes[i] >> 4 == 0b1110) {
+                continuations = 2;
+                c = bytes[i] & 0b1111;
+            } else if (bytes[i] >> 3 == 0b11110) {
+                continuations = 3;
+                c = bytes[i] & 0b111;
+            } else {
+                goto discard;
+            }
+            min_c = mins[continuations];
+        } else {
+            // continuation
+            if (continuations == 0)
+                goto discard;
+            continuations--;
+            c = (c << 6) | (bytes[i] & 0b111111);
+        }
+        clean_bytes[clean_i++] = bytes[i];
+        if (continuations == 0) {
+            if (c < min_c || c > 0x10FFFF)
+                goto discard; // out of range
+            if ((c >> 11) == 0x1b)
+                goto discard; // surrogate pair (this isn't cesu8)
+            clean_length = clean_i;
+        }
+        continue;
+        
+    discard:
+        // if we were in the middle of the sequence, see if this byte could start a sequence
+        if (clean_i != clean_length)
+            i--;
+        clean_i = clean_length;
+        continuations = 0;
+    }
+    cleanData.length = clean_length;
     return cleanData;
 }
 
@@ -128,16 +214,12 @@ NSData *removeInvalidUTF8(NSData *data) {
     }
     NSData *cleanData = removeInvalidUTF8(data);
     NSString *str = [[NSString alloc] initWithData:cleanData encoding:NSUTF8StringEncoding];
-    if (str == nil) {
-        // dammit what to do.
-        str = @"[invalid utf8]";
-    }
     
     NSError *err = nil;
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:@[str] options:0 error:&err];
     NSString *json = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
     NSAssert(err == nil, @"JSON serialization failed, wtf");
-    NSString *jsToEvaluate = [NSString stringWithFormat:@"term.write(%@[0])", json];
+    NSString *jsToEvaluate = [NSString stringWithFormat:@"termWrite(%@[0])", json];
     [self.webView evaluateJavaScript:jsToEvaluate completionHandler:nil];
 }
 
@@ -147,9 +229,10 @@ NSData *removeInvalidUTF8(NSData *data) {
 
 @end
 
-static int ios_tty_open(struct tty *tty) {
+static int ios_tty_init(struct tty *tty) {
     Terminal *terminal = [Terminal terminalWithType:tty->type number:tty->num];
     terminal.tty = tty;
+    tty->refcount++;
     tty->data = (void *) CFBridgingRetain(terminal);
 
     // termios
@@ -176,17 +259,18 @@ static int ios_tty_open(struct tty *tty) {
     return 0;
 }
 
-static ssize_t ios_tty_write(struct tty *tty, const void *buf, size_t len) {
+static int ios_tty_write(struct tty *tty, const void *buf, size_t len, bool blocking) {
     Terminal *terminal = (__bridge Terminal *) tty->data;
     return [terminal write:buf length:len];
 }
 
-static void ios_tty_close(struct tty *tty) {
+static void ios_tty_cleanup(struct tty *tty) {
     CFBridgingRelease(tty->data);
 }
 
-struct tty_driver ios_tty_driver = {
-    .open = ios_tty_open,
+struct tty_driver_ops ios_tty_ops = {
+    .init = ios_tty_init,
     .write = ios_tty_write,
-    .close = ios_tty_close,
+    .cleanup = ios_tty_cleanup,
 };
+DEFINE_TTY_DRIVER(ios_tty_driver, &ios_tty_ops, 1);

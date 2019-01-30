@@ -152,13 +152,13 @@ static inline long i2l(long v)
 #define OP ror
 #include "qemu-test-shift.h"
 
-//#define OP rcr
-//#define OP_CC
-//#include "qemu-test-shift.h"
+#define OP rcr
+#define OP_CC
+#include "qemu-test-shift.h"
 
-//#define OP rcl
-//#define OP_CC
-//#include "qemu-test-shift.h"
+#define OP rcl
+#define OP_CC
+#include "qemu-test-shift.h"
 
 #define OP shld
 #define OP_SHIFTD
@@ -174,7 +174,6 @@ static inline long i2l(long v)
 #undef CC_MASK
 #define CC_MASK (CC_C)
 
-#if 0
 #define OP bt
 #define OP_NOBYTE
 #include "qemu-test-shift.h"
@@ -190,7 +189,6 @@ static inline long i2l(long v)
 #define OP btc
 #define OP_NOBYTE
 #include "qemu-test-shift.h"
-#endif
 
 /* lea test (modrm support) */
 #define TEST_LEAQ(STR)\

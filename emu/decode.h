@@ -2,7 +2,6 @@
 #include "emu/cpu.h"
 #include "emu/modrm.h"
 #include "emu/interrupt.h"
-#include "kernel/calls.h"
 
 #undef oz
 #define oz OP_SIZE
@@ -14,6 +13,8 @@
 #undef DEFAULT_CHANNEL
 #define DEFAULT_CHANNEL instr
 #define TRACEI(msg, ...) TRACE(msg "\t", ##__VA_ARGS__)
+extern int current_pid(void);
+#define TRACEIP() TRACE("%d %08x\t", current_pid(), state->ip)
 
 // this will be the next PyEval_EvalFrameEx
 __no_instrument DECODER_RET glue(DECODER_NAME, OP_SIZE)(DECODER_ARGS) {
@@ -526,8 +527,8 @@ restart:
     switch (modrm.opcode) { \
         case 0: TRACE("rol"); ROL(count, val,z); break; \
         case 1: TRACE("ror"); ROR(count, val,z); break; \
-        case 2: TRACE("rcl"); UNDEFINED; \
-        case 3: TRACE("rcr"); UNDEFINED; \
+        case 2: TRACE("rcl"); RCL(count, val,z); break; \
+        case 3: TRACE("rcr"); RCR(count, val,z); break; \
         case 4: \
         case 6: TRACE("shl"); SHL(count, val,z); break; \
         case 5: TRACE("shr"); SHR(count, val,z); break; \
@@ -572,6 +573,8 @@ restart:
                 switch (insn << 4 | modrm.opcode) {
                     case 0xd80: TRACE("fadd mem32"); FADDM(mem_addr_real,32); break;
                     case 0xd81: TRACE("fmul mem32"); FMULM(mem_addr_real,32); break;
+                    case 0xd82: TRACE("fcom mem32"); FCOMM(mem_addr_real,32); break;
+                    case 0xd83: TRACE("fcomp mem32"); FCOMM(mem_addr_real,32); FPOP; break;
                     case 0xd84: TRACE("fsub mem32"); FSUBM(mem_addr_real,32); break;
                     case 0xd85: TRACE("fsubr mem32"); FSUBRM(mem_addr_real,32); break;
                     case 0xd86: TRACE("fdiv mem32"); FDIVM(mem_addr_real,32); break;
@@ -594,6 +597,7 @@ restart:
                     case 0xdb5: TRACE("fld mem80"); FLDM(mem_addr_real,80); break;
                     case 0xdc0: TRACE("fadd mem64"); FADDM(mem_addr_real,64); break;
                     case 0xdc1: TRACE("fmul mem64"); FMULM(mem_addr_real,64); break;
+                    case 0xdc2: TRACE("fcom mem64"); FCOMM(mem_addr_real,64); break;
                     case 0xdc3: TRACE("fcomp mem64"); FCOMM(mem_addr_real,64); FPOP; break;
                     case 0xdd0: TRACE("fld mem64"); FLDM(mem_addr_real,64); break;
                     case 0xdc4: TRACE("fsub mem64"); FSUBM(mem_addr_real,64); break;
@@ -603,8 +607,10 @@ restart:
                     case 0xdd2: TRACE("fst mem64"); FSTM(mem_addr_real,64); break;
                     case 0xdd3: TRACE("fstp mem64"); FSTM(mem_addr_real,64); FPOP; break;
                     case 0xde1: TRACE("fimuls mem16"); FIMUL(mem_addr,16); break;
+                    case 0xde6: TRACE("fidiv mem16"); FIDIV(mem_addr,16); break;
                     case 0xde7: TRACE("fidivrs mem16"); FIDIVR(mem_addr,16); break;
                     case 0xdf0: TRACE("fild mem16"); FILD(mem_addr,16); break;
+                    case 0xdf3: TRACE("fistp mem16"); FIST(mem_addr,16); FPOP; break;
                     case 0xdf5: TRACE("fild mem64"); FILD(mem_addr,64); break;
                     case 0xdf7: TRACE("fistp mem64"); FIST(mem_addr,64); FPOP; break;
                     default: TRACE("undefined"); UNDEFINED;
@@ -613,6 +619,8 @@ restart:
                 switch (insn << 4 | modrm.opcode) {
                     case 0xd80: TRACE("fadd st(i), st"); FADD(st_i, st_0); break;
                     case 0xd81: TRACE("fmul st(i), st"); FMUL(st_i, st_0); break;
+                    case 0xd82: TRACE("fcom st"); FCOM(); break;
+                    case 0xd83: TRACE("fcomp st"); FCOM(); FPOP; break;
                     case 0xd84: TRACE("fsub st(i), st"); FSUB(st_i, st_0); break;
                     case 0xd85: TRACE("fsubr st(i), st"); FSUBR(st_i, st_0); break;
                     case 0xd86: TRACE("fdiv st(i), st"); FDIV(st_i, st_0); break;
@@ -641,6 +649,7 @@ restart:
                     default: switch (insn << 8 | modrm.opcode << 4 | modrm.rm_opcode) {
                     case 0xd940: TRACE("fchs"); FCHS(); break;
                     case 0xd941: TRACE("fabs"); FABS(); break;
+                    case 0xd944: TRACE("fchs"); FCHS(); break;
                     case 0xd945: TRACE("fxam"); FXAM(); break;
                     case 0xd950: TRACE("fld1"); FLDC(one); break;
                     case 0xd951: TRACE("fldl2t"); FLDC(log2t); break;
@@ -655,6 +664,8 @@ restart:
                     case 0xd970: TRACE("fprem"); FPREM(); break;
                     case 0xd972: TRACE("fsqrt"); FSQRT(); break;
                     case 0xd974: TRACE("frndint"); FRNDINT(); break;
+                    case 0xd975: TRACE("fscale"); FSCALE(); break;
+                    case 0xde31: TRACE("fcompp"); FCOM(); FPOP; FPOP; break;
                     case 0xdf40: TRACE("fnstsw ax"); FSTSW(reg_a); break;
                     default: TRACE("undefined"); UNDEFINED;
                 }}
@@ -780,6 +791,14 @@ restart:
                         case 0x7e: TRACEI("movq modrm, xmm");
                                    READMODRM; MOVQ(modrm_val, modrm_reg); break;
                         case 0x18 ... 0x1f: TRACEI("repz nop modrm\t"); READMODRM; break;
+
+                        // tzcnt is like bsf but the result when the input is zero is defined as the operand size
+                        // for now, it can just be an alias
+                        case 0xbc: TRACEI("~~tzcnt~~ bsf modrm, reg");
+                                   READMODRM; BSF(modrm_val, modrm_reg,oz); break;
+                        case 0xbd: TRACEI("~~lzcnt~~ bsr modrm, reg");
+                                   READMODRM; BSR(modrm_val, modrm_reg,oz); break;
+
                         default: TRACE("undefined"); UNDEFINED;
                     }
                     break;

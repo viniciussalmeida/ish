@@ -8,7 +8,9 @@
 #import "TerminalViewController.h"
 #import "AppDelegate.h"
 #import "TerminalView.h"
+#import "BarButton.h"
 #import "ArrowBarButton.h"
+#import "UserPreferences.h"
 
 @interface TerminalViewController () <UIGestureRecognizerDelegate>
 
@@ -16,9 +18,10 @@
 @property UITapGestureRecognizer *tapRecognizer;
 @property (weak, nonatomic) IBOutlet TerminalView *termView;
 @property (weak, nonatomic) IBOutlet NSLayoutConstraint *bottomConstraint;
-@property (weak, nonatomic) IBOutlet NSLayoutConstraint *safeAreaBottomConstraint;
 
 @property (weak, nonatomic) IBOutlet UIButton *controlKey;
+@property (strong, nonatomic) IBOutletCollection(id) NSArray *barButtons;
+@property (strong, nonatomic) IBOutletCollection(id) NSArray *barControls;
 
 @property (weak, nonatomic) IBOutlet UIInputView *barView;
 @property (weak, nonatomic) IBOutlet UIStackView *bar;
@@ -53,8 +56,9 @@
                selector:@selector(ishExited:)
                    name:ISHExitedNotification
                  object:nil];
-
-    [self.termView registerExternalKeyboardNotificationsToNotificationCenter:center];
+    
+    [self _updateStyleFromPreferences:NO];
+    [[UserPreferences shared] addObserver:self forKeyPath:@"theme" options:NSKeyValueObservingOptionNew context:nil];
     
     if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
         [self.bar removeArrangedSubview:self.hideKeyboardButton];
@@ -65,6 +69,40 @@
     } else {
         self.barView.frame = CGRectMake(0, 0, 100, 55);
     }
+}
+
+- (void)dealloc {
+    @try {
+        [[UserPreferences shared] removeObserver:self forKeyPath:@"theme"];
+    } @catch (NSException * __unused exception) {}
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    if (object == [UserPreferences shared]) {
+        [self _updateStyleFromPreferences:YES];
+    } else {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+    }
+}
+
+- (void)_updateStyleFromPreferences:(BOOL)animated {
+    NSTimeInterval duration = animated ? 0.1 : 0;
+    [UIView animateWithDuration:duration animations:^{
+        self.view.backgroundColor = UserPreferences.shared.theme.backgroundColor;
+        UIKeyboardAppearance keyAppearance = UserPreferences.shared.theme.keyboardAppearance;
+        self.termView.keyboardAppearance = keyAppearance;
+        for (BarButton *button in self.barButtons) {
+            button.keyAppearance = keyAppearance;
+        }
+        UIColor *tintColor = keyAppearance == UIKeyboardAppearanceLight ? UIColor.blackColor : UIColor.whiteColor;
+        for (UIControl *control in self.barControls) {
+            control.tintColor = tintColor;
+        }
+    }];
+}
+
+- (UIStatusBarStyle)preferredStatusBarStyle {
+    return UserPreferences.shared.theme.statusBarStyle;
 }
 
 - (BOOL)prefersStatusBarHidden {
@@ -80,14 +118,10 @@
         NSValue *frame = notification.userInfo[UIKeyboardFrameEndUserInfoKey];
         pad = frame.CGRectValue.size.height;
     }
-    self.bottomConstraint.constant = -pad;
     if (pad == 0) {
-        self.bottomConstraint.active = NO;
-        self.safeAreaBottomConstraint.active = YES;
-    } else {
-        self.safeAreaBottomConstraint.active = NO;
-        self.bottomConstraint.active = YES;
+        pad = self.view.safeAreaInsets.bottom;
     }
+    self.bottomConstraint.constant = -pad;
     [self.view setNeedsUpdateConstraints];
     
     if (!initialLayout) {
@@ -110,9 +144,12 @@
 
 - (void)displayExitThing {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"attempted to kill init" message:nil preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"goodbye" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        exit(0);
+    [alert addAction:[UIAlertAction actionWithTitle:@"exit" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        id delegate = [UIApplication sharedApplication].delegate;
+        [delegate exitApp];
     }]];
+    if ([UserPreferences.shared hasChangedLaunchCommand])
+        [alert addAction:[UIAlertAction actionWithTitle:@"i typed the init command wrong, let me fix it" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -168,10 +205,10 @@
     
 - (IBAction)pressArrow:(ArrowBarButton *)sender {
     switch (sender.direction) {
-        case ArrowUp: [self pressKey:@"\x1b[A"]; break;
-        case ArrowDown: [self pressKey:@"\x1b[B"]; break;
-        case ArrowLeft: [self pressKey:@"\x1b[D"]; break;
-        case ArrowRight: [self pressKey:@"\x1b[C"]; break;
+        case ArrowUp: [self pressKey:[self.terminal arrow:'A']]; break;
+        case ArrowDown: [self pressKey:[self.terminal arrow:'B']]; break;
+        case ArrowLeft: [self pressKey:[self.terminal arrow:'D']]; break;
+        case ArrowRight: [self pressKey:[self.terminal arrow:'C']]; break;
         case ArrowNone: break;
     }
 }

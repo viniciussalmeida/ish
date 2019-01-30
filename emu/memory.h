@@ -3,7 +3,6 @@
 
 #include <stdatomic.h>
 #include <unistd.h>
-#include <string.h>
 #include "util/list.h"
 #include "util/sync.h"
 #include "misc.h"
@@ -16,14 +15,11 @@ typedef dword_t page_t;
 #define BAD_PAGE 0x10000
 
 struct mem {
-    atomic_uint refcount;
     atomic_uint changes; // increment whenever a tlb flush is needed
-    struct pt_entry *pt; // TODO replace with red-black tree
+    struct pt_entry **pgdir;
+    int pgdir_used;
 
     // TODO put these in their own mm struct maybe
-    addr_t vdso; // immutable
-    addr_t start_brk; // immutable
-    addr_t brk;
 #if JIT
     struct jit *jit;
 #endif
@@ -31,13 +27,14 @@ struct mem {
     wrlock_t lock;
 };
 #define MEM_PAGES (1 << 20) // at least on 32-bit
+#define MEM_PGDIR_SIZE (1 << 10)
 
-// Create a new address space
-struct mem *mem_new(void);
-// Increment the refcount
-void mem_retain(struct mem *mem);
-// Decrement the refcount, destroy everything in the space if 0
-void mem_release(struct mem *mem);
+// Initialize the address space
+void mem_init(struct mem *mem);
+// Uninitialize the address space
+void mem_destroy(struct mem *mem);
+// Return the pagetable entry for the given page
+struct pt_entry *mem_pt(struct mem *mem, page_t page);
 
 #define PAGE_BITS 12
 #undef PAGE_SIZE // defined in system headers somewhere
@@ -52,6 +49,7 @@ typedef dword_t pages_t;
 
 struct data {
     void *data; // immutable
+    size_t size; // also immutable
     atomic_uint refcount;
 };
 struct pt_entry {

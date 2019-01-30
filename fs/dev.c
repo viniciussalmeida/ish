@@ -1,16 +1,18 @@
 #include "kernel/errno.h"
 #include "fs/fd.h"
 #include "fs/dev.h"
+#include "fs/mem.h"
 #include "fs/tty.h"
 
-#pragma GCC diagnostic ignored "-Winitializer-overrides"
-struct dev_ops *block_devs[] = {
-    [0 ... 255] = NULL,
+struct dev_ops *block_devs[256] = {
+    // no block devices yet
 };
-struct dev_ops *char_devs[] = {
-    [0 ... 255] = NULL,
-    [1] = &null_dev,
+struct dev_ops *char_devs[256] = {
+    [1] = &mem_dev,
     [4] = &tty_dev,
+    [5] = &tty_dev,
+    [TTY_PSEUDO_MASTER_MAJOR] = &tty_dev,
+    [TTY_PSEUDO_SLAVE_MAJOR] = &tty_dev,
 };
 
 int dev_open(int major, int minor, int type, struct fd *fd) {
@@ -20,24 +22,5 @@ int dev_open(int major, int minor, int type, struct fd *fd) {
     fd->ops = &dev->fd;
     if (!dev->open)
         return 0;
-    return dev->open(major, minor, type, fd);
+    return dev->open(major, minor, fd);
 }
-
-// this device seemed so simple it was hardly worth making a new file for it
-
-static int null_open(int major, int minor, int type, struct fd *fd) {
-    if (minor != 3)
-        return _ENXIO;
-    return 0;
-}
-static ssize_t null_read(struct fd *fd, void *buf, size_t bufsize) {
-    return 0;
-}
-static ssize_t null_write(struct fd *fd, const void *buf, size_t bufsize) {
-    return bufsize;
-}
-struct dev_ops null_dev = {
-    .open = null_open,
-    .fd.read = null_read,
-    .fd.write = null_write,
-};

@@ -1,5 +1,7 @@
+#define _GNU_SOURCE
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +9,7 @@
 
 #include "misc.h"
 #include "kernel/calls.h"
+#include "kernel/random.h"
 #include "kernel/errno.h"
 #include "fs/fd.h"
 #include "kernel/elf.h"
@@ -158,9 +161,12 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
     // from this point on, if any error occurs the process will have to be
     // killed before it even starts. please don't be too sad about it, it's
     // just a process.
-    mem_release(current->mem);
-    current->mem = current->cpu.mem = mem_new();
+    mm_release(current->mm);
+    current->mm = mm_new();
+    current->mem = current->cpu.mem = &current->mm->mem;
     write_wrlock(&current->mem->lock);
+
+    current->mm->exefile = fd_retain(fd);
 
     addr_t load_addr; // used for AX_PHDR
     bool load_addr_set = false;
@@ -185,8 +191,8 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
 
         // we have to know where the brk starts
         addr_t brk = bias + ph[i].vaddr + ph[i].memsize;
-        if (brk > current->mem->start_brk)
-            current->mem->start_brk = current->mem->brk = BYTES_ROUND_UP(brk);
+        if (brk > current->mm->start_brk)
+            current->mm->start_brk = current->mm->brk = BYTES_ROUND_UP(brk);
     }
 
     addr_t entry = bias + header.entry_point;
@@ -228,8 +234,8 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
         goto beyond_hope;
     if ((err = pt_map(current->mem, vdso_page, vdso_pages, (void *) vdso_data, 0)) < 0)
         goto beyond_hope;
-    current->mem->vdso = vdso_page << PAGE_BITS;
-    addr_t vdso_entry = current->mem->vdso + ((struct elf_header *) vdso_data)->entry_point;
+    current->mm->vdso = vdso_page << PAGE_BITS;
+    addr_t vdso_entry = current->mm->vdso + ((struct elf_header *) vdso_data)->entry_point;
 
     // map 3 empty "vvar" pages to satisfy ptraceomatic
     page_t vvar_page = pt_find_hole(current->mem, 3);
@@ -259,9 +265,11 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
     addr_t envp_addr = sp = copy_strings(sp, envp);
     if (sp == 0)
         goto beyond_hope;
+    current->mm->argv_end = sp;
     addr_t argv_addr = sp = copy_strings(sp, argv);
     if (sp == 0)
         goto beyond_hope;
+    current->mm->argv_start = sp;
     sp = align_stack(sp);
 
     addr_t platform_addr = sp = copy_string(sp, "i686");
@@ -269,11 +277,7 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
         goto beyond_hope;
     // 16 random bytes so no system call is needed to seed a userspace RNG
     char random[16] = {};
-    int dev_random = open("/dev/urandom", O_RDONLY);
-    if (dev_random < 0 ||
-            read(dev_random, random, sizeof(random)) != sizeof(random))
-        abort(); // if this fails, something is very badly wrong indeed
-    close(dev_random);
+    get_random(random, sizeof(random)); // if this fails, eh, no one's really using it
     addr_t random_addr = sp -= sizeof(random);
     if (user_put(sp, random))
         goto beyond_hope;
@@ -285,7 +289,7 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
     // declare elf aux now so we can know how big it is
     struct aux_ent aux[] = {
         {AX_SYSINFO, vdso_entry},
-        {AX_SYSINFO_EHDR, current->mem->vdso},
+        {AX_SYSINFO_EHDR, current->mm->vdso},
         {AX_HWCAP, 0x00000000}, // suck that
         {AX_PAGESZ, PAGE_SIZE},
         {AX_CLKTCK, 0x64},
@@ -352,7 +356,7 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
 out_free_interp:
     if (interp_name != NULL)
         free(interp_name);
-    if (interp_fd != NULL)
+    if (interp_fd != NULL && !IS_ERR(interp_fd))
         fd_close(interp_fd);
     if (interp_ph != NULL)
         free(interp_ph);
@@ -411,6 +415,14 @@ static inline int user_memset(addr_t start, byte_t val, dword_t len) {
     return 0;
 }
 
+static int format_exec(struct fd *fd, const char *file, char *const argv[], char *const envp[]) {
+    int err = elf_exec(fd, file, argv, envp);
+    if (err != _ENOEXEC)
+        return err;
+    // other formats would go here
+    return _ENOEXEC;
+}
+
 static int shebang_exec(struct fd *fd, const char *file, char *const argv[], char *const envp[]) {
     // read the first 128 bytes to get the shebang line out of
     if (fd->ops->lseek(fd, 0, SEEK_SET))
@@ -463,7 +475,13 @@ static int shebang_exec(struct fd *fd, const char *file, char *const argv[], cha
         real_argv[1] = argument;
     real_argv[args_extra - 1] = (char *) file; // maybe you'll have better luck getting rid of this cast
     memcpy(real_argv + args_extra, argv + 1, (count_args(argv)) * sizeof(argv[0]));
-    return sys_execve(interpreter, real_argv, envp);
+
+    struct fd *interpreter_fd = generic_open(interpreter, O_RDONLY_, 0);
+    if (IS_ERR(interpreter_fd))
+        return PTR_ERR(interpreter_fd);
+    int err = format_exec(interpreter_fd, interpreter, real_argv, envp);
+    fd_close(interpreter_fd);
+    return err;
 }
 
 int sys_execve(const char *file, char *const argv[], char *const envp[]) {
@@ -471,23 +489,61 @@ int sys_execve(const char *file, char *const argv[], char *const envp[]) {
     if (IS_ERR(fd))
         return PTR_ERR(fd);
 
-    int err = elf_exec(fd, file, argv, envp);
-    if (err != _ENOEXEC)
-        goto found;
-    err = shebang_exec(fd, file, argv, envp);
-    if (err != _ENOEXEC)
-        goto found;
+    struct statbuf stat;
+    int err = fd->mount->fs->fstat(fd, &stat);
+    if (err < 0) {
+        fd_close(fd);
+        return err;
+    }
 
-found:
+    // if nobody has permission to execute, it should be safe to not execute
+    if (!(stat.mode & 0111)) {
+        fd_close(fd);
+        return _EACCES;
+    }
+
+    err = format_exec(fd, file, argv, envp);
+    if (err == _ENOEXEC)
+        err = shebang_exec(fd, file, argv, envp);
     fd_close(fd);
-    for (fd_t f = 0; f < current->files->size; f++)
-        if (f_is_cloexec(f))
-            f_close(f);
-    lock(&current->vfork_lock);
-    current->vfork_done = true;
-    notify(&current->vfork_cond);
-    unlock(&current->vfork_lock);
+    if (err < 0)
+        return err;
 
+    // setuid/setgid
+    if (stat.mode & S_ISUID) {
+        current->suid = current->euid;
+        current->euid = stat.uid;
+    }
+    if (stat.mode & S_ISGID) {
+        current->sgid = current->egid;
+        current->egid = stat.gid;
+    }
+
+    // save current->comm
+    lock(&current->general_lock);
+    const char *basename = strrchr(file, '/');
+    if (basename == NULL)
+        basename = file;
+    else
+        basename++;
+    strncpy(current->comm, basename, sizeof(current->comm));
+    unlock(&current->general_lock);
+
+    // set the thread name
+    char threadname[16];
+    strncpy(threadname, current->comm, sizeof(threadname)-1);
+    threadname[15] = '\0';
+#if __APPLE__
+    pthread_setname_np(threadname);
+#else
+    pthread_setname_np(pthread_self(), threadname);
+#endif
+
+    // cloexec
+    // consider putting this in fd.c?
+    fdtable_do_cloexec(current->files);
+
+    // reset signal handlers
     lock(&current->sighand->lock);
     for (int sig = 0; sig < NUM_SIGS; sig++) {
         struct sigaction_ *action = &current->sighand->action[sig];
@@ -498,7 +554,8 @@ found:
     unlock(&current->sighand->lock);
 
     current->did_exec = true;
-    return err;
+    vfork_notify(current);
+    return 0;
 }
 
 #define MAX_ARGS 256 // for now
@@ -521,7 +578,7 @@ dword_t _sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
         argv[i] = malloc(MAX_PATH);
         if (user_read_string(arg, argv[i], MAX_PATH))
             return _EFAULT;
-        STRACE("\"%s\", ", argv[i]);
+        STRACE("\"%.100s\", ", argv[i]);
     }
     argv[i] = NULL;
     char *envp[MAX_ARGS];
@@ -536,7 +593,7 @@ dword_t _sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
         envp[i] = malloc(MAX_PATH);
         if (user_read_string(arg, envp[i], MAX_PATH))
             return _EFAULT;
-        STRACE("\"%s\", ", envp[i]);
+        STRACE("\"%.100s\", ", envp[i]);
     }
     envp[i] = NULL;
     STRACE("})");

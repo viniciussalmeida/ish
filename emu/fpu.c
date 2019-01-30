@@ -1,8 +1,9 @@
 // I don't remember if the interpreter was supposed to use this in addition to the jit
+#include <math.h>
+#include <string.h>
 #include "emu/cpu.h"
 #include "emu/float80.h"
 #include "emu/fpu.h"
-#include <math.h>
 
 #define ST(i) cpu->fp[cpu->top + i]
 
@@ -82,6 +83,15 @@ void fpu_stm80(struct cpu_state *cpu, float80 *f) {
 
 void fpu_prem(struct cpu_state *cpu) {
     ST(0) = f80_mod(ST(0), ST(1));
+    cpu->c2 = 0; // say we finished the entire remainder
+}
+
+void fpu_scale(struct cpu_state *cpu) {
+    enum f80_rounding_mode old_mode = f80_rounding_mode;
+    f80_rounding_mode = round_chop;
+    int scale = f80_to_int(ST(1));
+    f80_rounding_mode = old_mode;
+    ST(0) = f80_scale(ST(0), scale);
 }
 
 void fpu_rndint(struct cpu_state *cpu) {
@@ -113,7 +123,7 @@ static void fpu_comparei(struct cpu_state *cpu, float80 x) {
         cpu->zf = cpu->pf = cpu->cf = 1;
 }
 static void fpu_compare(struct cpu_state *cpu, float80 x) {
-    cpu->c1 = 0;
+    cpu->c2 = cpu->c1 = 0;
     cpu->c0 = f80_lt(ST(0), x);
     cpu->c3 = f80_eq(ST(0), x);
     if (f80_uncomparable(ST(0), x))
@@ -125,8 +135,14 @@ void fpu_com(struct cpu_state *cpu, int i) {
 void fpu_comi(struct cpu_state *cpu, int i) {
     fpu_comparei(cpu, ST(i));
 }
+void fpu_comm32(struct cpu_state *cpu, float *f) {
+    fpu_compare(cpu, f80_from_double(*f));
+}
 void fpu_comm64(struct cpu_state *cpu, double *f) {
     fpu_compare(cpu, f80_from_double(*f));
+}
+void fpu_tst(struct cpu_state *cpu) {
+    fpu_compare(cpu, fpu_consts[fconst_zero]);
 }
 
 void fpu_abs(struct cpu_state *cpu) {

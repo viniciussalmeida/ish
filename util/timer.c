@@ -9,12 +9,23 @@ struct timer *timer_new(timer_callback_t callback, void *data) {
     timer->callback = callback;
     timer->data = data;
     timer->running = false;
+    timer->dead = false;
     lock_init(&timer->lock);
     return timer;
 }
 
 void timer_free(struct timer *timer) {
-    free(timer);
+    lock(&timer->lock);
+    if (timer->running) {
+        timer->running = false;
+        timer->dead = true;
+        pthread_kill(timer->thread, SIGUSR1);
+        unlock(&timer->lock);
+    } else {
+        unlock(&timer->lock);
+        if (!timer->dead)
+            free(timer);
+    }
 }
 
 static void *timer_thread(void *param) {
@@ -38,7 +49,10 @@ static void *timer_thread(void *param) {
         }
     }
     timer->running = false;
-    unlock(&timer->lock);
+    if (timer->dead)
+        free(timer);
+    else
+        unlock(&timer->lock);
     return NULL;
 }
 

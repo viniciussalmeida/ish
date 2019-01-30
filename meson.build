@@ -1,5 +1,5 @@
 project('ish', 'c',
-    default_options: ['default_library=static', 'c_std=gnu11', 'jit=true'])
+    default_options: ['default_library=static', 'c_std=gnu11', 'jit=true', 'warning_level=2'])
 
 log_on = get_option('log').split()
 log_off = get_option('nolog').split()
@@ -28,8 +28,6 @@ cc = meson.get_compiler('c')
 threads = dependency('threads')
 librt = cc.find_library('rt', required: false)
 libm = cc.find_library('m', required: false)
-
-gdbm = subproject('gdbm').get_variable('gdbm')
 
 subdir('vdso') # ish depends on the vdso
 
@@ -60,10 +58,14 @@ src = [
     'kernel/signal.c',
     'kernel/resource.c',
     'kernel/random.c',
+    'kernel/prctl.c',
+    'kernel/eventfd.c',
 
     'kernel/fs.c',
     'kernel/fs_info.c',
+    'fs/mount.c',
     'fs/fd.c',
+    'fs/inode.c',
     'fs/stat.c',
     'fs/dir.c',
     'fs/generic.c',
@@ -71,25 +73,38 @@ src = [
     'fs/real.c',
     'fs/fake.c',
     'fs/fake-rebuild.c',
+    'fs/fake-migrate.c',
+
+    'fs/proc.c',
+    'fs/proc/entry.c',
+    'fs/proc/root.c',
+    'fs/proc/pid.c',
 
     'fs/adhoc.c',
     'fs/sock.c',
     'fs/pipe.c',
+    'fs/sockrestart.c',
 
     'fs/dev.c',
+    'fs/mem.c',
     'fs/tty.c',
     'fs/tty-real.c',
+    'fs/pty.c',
 
     'fs/poll.c',
     'kernel/poll.c',
+    'kernel/epoll.c',
 
     'util/timer.c',
     'util/sync.c',
+    'util/fifo.c',
 
     'emu/memory.c',
     'emu/tlb.c',
     'emu/fpu.c',
     'emu/float80.c',
+
+    'platform/' + host_machine.system() + '.c',
 ]
 if get_option('jit')
     gadgets = 'jit/gadgets-' + host_machine.cpu_family()
@@ -112,12 +127,15 @@ else
     ]
 endif
 
+sqlite3 = cc.find_library('sqlite3')
+
+dependencies = [librt, libm, threads, sqlite3]
+
 libish = library('ish', src,
-    include_directories: includes,
-    dependencies: [librt, libm, threads, gdbm])
+    include_directories: includes)
 ish = declare_dependency(
     link_with: libish,
-    dependencies: [librt, libm, threads, gdbm],
+    dependencies: dependencies,
     include_directories: includes)
 
 # ptraceomatic et al
@@ -137,6 +155,6 @@ endforeach
 
 if not meson.is_cross_build()
     # test for floating point library
-    float80_test = executable('float80_test', ['emu/float80.c', 'emu/float80-test.c'])
+    float80_test = executable('float80_test', ['emu/float80.c', 'emu/float80-test.c'], dependencies: [libm])
     test('float80', float80_test)
 endif

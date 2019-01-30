@@ -42,24 +42,82 @@
                 strb wzr, [_cpu, CPU_of]
             .endif
 
-            .ifc \type,rol
-                sub w8, wzr, w8
-                add w8, w8, \size
-                ror _tmp, _tmp, w8
-                ubfx w9, _tmp, 0, 1
-                ubfx w10, _tmp, \size-1, 1
+            # regrets
+            .ifin(\type, rol,ror)
+                .ifb \s
+                    .ifc \type,rol
+                        neg w8, w8
+                    .endif
+                    ror _tmp, _tmp, w8
+                .else
+                    # kill me
+                    uxt\s _tmp, _tmp
+                    neg w9, w8
+                    and w8, w8, \size-1
+                    and w9, w9, \size-1
+                    .ifc \type,rol
+                        lsl w8, _tmp, w8
+                        lsr w9, _tmp, w9
+                    .else
+                        lsr w8, _tmp, w8
+                        lsl w9, _tmp, w9
+                    .endif
+                    orr _tmp, w8, w9
+                .endif
+                .ifc \type,rol
+                    ubfx w9, _tmp, 0, 1
+                    ubfx w10, _tmp, \size-1, 1
+                .else
+                    ubfx w9, _tmp, \size-1, 1
+                    ubfx w10, _tmp, \size-2, 1
+                .endif
                 eor w10, w10, w9
                 strb w9, [_cpu, CPU_cf]
                 strb w10, [_cpu, CPU_of]
-            .endif
-            .ifc \type,ror
-                ror _tmp, _tmp, w8
-                ubfx w9, _tmp, \size-1, 1
-                ubfx w10, _tmp, \size-2, 1
-                eor w10, w10, w9
+            .endifin
+
+            # aaaaaaaaaaaaaa
+            .ifin(\type, rcl,rcr)
+                .ifc \type,rcr
+                    ubfx w9, _tmp, \size-1, 1
+                    ldrb w10, [_cpu, CPU_cf]
+                    eor w9, w9, w10
+                    strb w9, [_cpu, CPU_of]
+                .endif
+
+                ldrb w9, [_cpu, CPU_cf]
+                lsl x9, x9, \size
+                orr _xtmp, _xtmp, x9
+                # so ok we mask the shift count, not too hard
+                and w8, w8, 31
+                # ...now mod by \size+1 oof
+                .if \size == 8
+                    .irpc _, 123
+                        subs w10, w8, \size+1
+                        csel w8, w10, w8, gt
+                    .endr
+                .elseif \size == 16
+                    subs w10, w8, \size+1
+                    csel w8, w10, w8, gt
+                .endif
+                mov w9, \size+1
+                sub w9, w9, w8
+                .ifc \type,rcl
+                    lsl x8, _xtmp, x8
+                    lsr x9, _xtmp, x9
+                .else
+                    lsr x8, _xtmp, x8
+                    lsl x9, _xtmp, x9
+                .endif
+                orr _xtmp, x8, x9
+                ubfx x9, _xtmp, \size, 1
                 strb w9, [_cpu, CPU_cf]
-                strb w10, [_cpu, CPU_of]
-            .endif
+                .ifc \type,rcl
+                    ubfx w10, _tmp, \size-1, 1
+                    eor w10, w10, w9
+                    strb w10, [_cpu, CPU_of]
+                .endif
+            .endifin
 
             .ifin(\type, shl,shr,sar)
                 setf_zsp \s
@@ -74,7 +132,7 @@
     .endr
 .endm
 
-.irp type, shl,shr,sar,rol,ror
+.irp type, shl,shr,sar,rol,ror,rcl,rcr
     .irp size, 8,16,32
         ss \size, do_shift, \type
     .endr
@@ -127,32 +185,74 @@
     .endr
 .endr
 
-.macro do_bt_w8
-    and _tmp, _tmp, 0x1f
-    lsr w8, w8, _tmp
-    and w8, w8, 1
-    strb w8, [_cpu, CPU_cf]
+.macro do_bt_op op, arg, size, s
+    .ifc \op,bt
+        .ifnc \arg, w8
+            mov w8, \arg
+        .endif
+        and _tmp, _tmp, \size-1
+        lsr w8, w8, _tmp
+        and w8, w8, 1
+        strb w8, [_cpu, CPU_cf]
+    .else
+        mov w9, 1
+        and _tmp, _tmp, \size-1
+        lsl w9, w9, _tmp
+        tst \arg, w9
+        .ifc \op,btc
+            eor \arg, \arg, w9
+        .else N .ifc \op,bts
+            orr \arg, \arg, w9
+        .else N .ifc \op,btr
+            bic \arg, \arg, w9
+        .endif N .endif N .endif
+        cset w9, ne
+        strb w9, [_cpu, CPU_cf]
+    .endif
 .endm
 
-.gadget bt32_mem
-    bic w8, _tmp, 0x1f
-    add _addr, _addr, w8, lsr 3
-    read_prep 32, bt32_mem
-    ldr w8, [_xaddr]
-    do_bt_w8
-    gret 1
-    read_bullshit 32, bt32_mem
+.macro do_bt op, size, s
+    .gadget \op\size\()_mem
+        bic w8, _tmp, 0x1f
+        add _addr, _addr, w8, lsr 3
+        # hell {{{
+        .ifin(\op, bt)
+            read_prep \size, \op\size\()_mem
+        .endifin
+        .ifin(\op, btc,bts,btr)
+            write_prep \size, \op\size\()_mem
+        .endifin
+        # }}}
+        ldr w8, [_xaddr]
+        do_bt_op \op, w8, \size, \s
+        .ifin(\op, btc,bts,btr)
+            write_done \size, \op\size\()_mem
+        .endifin
+        gret 1
+        # also hell {{{
+        .ifin(\op, bt)
+            read_bullshit \size, \op\size\()_mem
+        .endifin
+        .ifin(\op, btc,bts,btr)
+            write_bullshit \size, \op\size\()_mem
+        .endifin
+        # }}}
 
-.macro x name reg
-    .gadget bt32_\name
-        mov w8, \reg
-        do_bt_w8
-        gret
+    .macro x name, reg
+        .gadget \op\size\()_\name
+            do_bt_op \op, \reg, \size, \s
+            gret
+    .endm
+    .each_reg x
+    .purgem x
 .endm
-.each_reg x
-.purgem x
 
-.gadget_array bt
+.irp op, bt,btc,bts,btr
+    .irp size, 16,32
+        ss \size, do_bt, \op
+    .endr
+    .gadget_array \op
+.endr
 
 .macro x name reg
     .gadget bswap_\name

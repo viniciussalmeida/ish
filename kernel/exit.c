@@ -1,6 +1,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include "kernel/calls.h"
+#include "kernel/mm.h"
 #include "kernel/futex.h"
 #include "fs/fd.h"
 
@@ -8,20 +9,21 @@ static void halt_system(int status);
 
 static bool exit_tgroup(struct task *task) {
     struct tgroup *group = task->group;
-    lock(&group->lock);
     list_remove(&task->group_links);
     bool group_dead = list_empty(&group->threads);
     if (group_dead) {
-        if (group->timer) {
-            timer_set(group->timer, (struct timer_spec) {}, NULL);
-        }
+        lock(&group->lock);
+        if (group->timer)
+            timer_free(group->timer);
+        unlock(&group->lock);
+        list_remove(&group->pgroup);
+        list_remove(&group->session);
     }
-    unlock(&group->lock);
     return group_dead;
 }
 
 noreturn void do_exit(int status) {
-    // has to happen before mem_release
+    // has to happen before mm_release
     addr_t clear_tid = current->clear_tid;
     if (clear_tid) {
         pid_t_ zero = 0;
@@ -30,15 +32,13 @@ noreturn void do_exit(int status) {
     }
 
     // release all our resources
-    mem_release(current->mem);
+    mm_release(current->mm);
     fdtable_release(current->files);
     fs_info_release(current->fs);
     sighand_release(current->sighand);
-    bool group_dead = exit_tgroup(current);
-    vfork_notify(current);
 
     // save things that our parent might be interested in
-    current->exit_code = status;
+    current->exit_code = status; // FIXME locking
     struct rusage_ rusage = rusage_get_current();
     lock(&current->group->lock);
     rusage_add(&current->group->rusage, &rusage);
@@ -47,22 +47,30 @@ noreturn void do_exit(int status) {
     // the actual freeing needs pids_lock
     lock(&pids_lock);
     struct task *leader = current->group->leader;
-    if (current != leader)
-        task_destroy(current);
 
-    if (group_dead) {
+    if (exit_tgroup(current)) {
+        // reparent children
+        struct task *new_parent = pid_get_task(1);
+        struct task *child;
+        list_for_each_entry(&current->children, child, siblings) {
+            child->parent = new_parent;
+        }
+
         // notify parent that we died
         struct task *parent = leader->parent;
         if (parent == NULL) {
             // init died
             halt_system(status);
         } else {
-            lock(&parent->group->lock);
             leader->zombie = true;
             notify(&parent->group->child_exit);
-            unlock(&parent->group->lock);
+            send_signal(parent, leader->exit_signal);
         }
     }
+
+    vfork_notify(current);
+    if (current != leader)
+        task_destroy(current);
     unlock(&pids_lock);
 
     pthread_exit(NULL);
@@ -81,7 +89,9 @@ noreturn void do_exit_group(int status) {
     // kill everyone else in the group
     struct task *task;
     list_for_each_entry(&group->threads, task, group_links) {
-        send_signal(task, SIGKILL_);
+        deliver_signal(task, SIGKILL_);
+        task->group->stopped = false;
+        notify(&task->group->stopped_cond);
     }
 
     unlock(&group->lock);
@@ -100,32 +110,34 @@ static void halt_system(int status) {
     }
 
     // unmount all filesystems
-    struct mount *mount = mounts;
-    while (mount) {
-        if (mount->fs->umount)
-            mount->fs->umount(mount);
-        mount = mount->next;
+    lock(&mounts_lock);
+    struct mount *mount, *tmp;
+    list_for_each_entry_safe(&mounts, mount, tmp, mounts) {
+        mount_remove(mount);
     }
+    unlock(&mounts_lock);
 
     if (exit_hook != NULL)
         exit_hook(status);
 }
 
 dword_t sys_exit(dword_t status) {
-    STRACE("exit(%d)", status);
+    STRACE("exit(%d)\n", status);
     do_exit(status << 8);
 }
 
 dword_t sys_exit_group(dword_t status) {
-    STRACE("exit_group(%d)", status);
+    STRACE("exit_group(%d)\n", status);
     do_exit_group(status << 8);
 }
 
+#define WNOHANG_ 1
+#define WUNTRACED_ 2
+
 // returns 0 if the task cannot be reaped, returns 1 if the task was reaped
-static int reap_if_zombie(struct task *task, addr_t status_addr, addr_t rusage_addr) {
-    assert(task_is_leader(task));
+static bool reap_if_zombie(struct task *task, addr_t status_addr, addr_t rusage_addr) {
     if (!task->zombie)
-        return 0;
+        return false;
     lock(&task->group->lock);
 
     dword_t exit_code = task->exit_code;
@@ -136,8 +148,9 @@ static int reap_if_zombie(struct task *task, addr_t status_addr, addr_t rusage_a
             return _EFAULT;
 
     struct rusage_ rusage = task->group->rusage;
-    // current->group is already locked
+    lock(&current->group->lock);
     rusage_add(&current->group->children_rusage, &rusage);
+    unlock(&current->group->lock);
     if (rusage_addr != 0)
         if (user_put(rusage_addr, rusage))
             return _EFAULT;
@@ -146,32 +159,65 @@ static int reap_if_zombie(struct task *task, addr_t status_addr, addr_t rusage_a
     cond_destroy(&task->group->child_exit);
     free(task->group);
     task_destroy(task);
-    return 1;
+    return true;
 }
 
-#define WNOHANG_ 1
+static bool notify_if_stopped(struct task *task, addr_t status_addr) {
+    // FIXME the check of task->group->stopped needs locking I think
+    if (!task->group->stopped || task->group->group_exit_code == 0)
+        return false;
+    dword_t exit_code = task->group->group_exit_code;
+    task->group->group_exit_code = 0;
+    if (status_addr != 0)
+        if (user_put(status_addr, exit_code))
+            return _EFAULT;
+    return true;
+}
+
+static bool reap_if_needed(struct task *task, int_t options, addr_t status_addr, addr_t rusage_addr) {
+    assert(task_is_leader(task));
+    if (options & WUNTRACED_ && notify_if_stopped(task, status_addr))
+        return true;
+    if (reap_if_zombie(task, status_addr, rusage_addr))
+        return true;
+    return false;
+}
 
 dword_t sys_wait4(dword_t id, addr_t status_addr, dword_t options, addr_t rusage_addr) {
     STRACE("wait(%d, 0x%x, 0x%x, 0x%x)", id, status_addr, options, rusage_addr);
     lock(&pids_lock);
     int err;
+    pid_t_ out_id;
 
 retry:
     if (id == (dword_t) -1) {
         // look for a zombie child
-        struct task *task;
-        list_for_each_entry(&current->children, task, siblings) {
-            id = task->pid;
-            if (reap_if_zombie(task, status_addr, rusage_addr))
-                goto found_zombie;
+        bool no_children = true;
+        struct task *parent;
+        list_for_each_entry(&current->group->threads, parent, group_links) {
+            struct task *task;
+            list_for_each_entry(&current->children, task, siblings) {
+                if (!task_is_leader(task))
+                    continue;
+                no_children = false;
+                out_id = task->pid;
+                if (reap_if_needed(task, options, status_addr, rusage_addr))
+                    goto found_zombie;
+            }
+        }
+        if (no_children) {
+            err = _ECHILD;
+            goto error;
         }
     } else {
         // check if this child is a zombie
         struct task *task = pid_get_task_zombie(id);
         err = _ECHILD;
-        if (task == NULL || task->parent != current)
+        if (task == NULL || task->parent == NULL || task->parent->group != current->group)
             goto error;
-        if (reap_if_zombie(task, status_addr, rusage_addr))
+        task = task->group->leader;
+        out_id = id;
+        if (reap_if_needed(task, options, status_addr, rusage_addr))
             goto found_zombie;
     }
 
@@ -187,7 +233,7 @@ retry:
 
 found_zombie:
     unlock(&pids_lock);
-    return id;
+    return out_id;
 error:
     unlock(&pids_lock);
     return err;

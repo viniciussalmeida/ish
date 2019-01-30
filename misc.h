@@ -35,6 +35,7 @@
 #else
 #define __no_instrument
 #endif
+#define UNUSED(x) UNUSED_##x __attribute__((unused))
 
 #if defined(__x86_64__)
 #define rdtsc() ({ \
@@ -62,7 +63,7 @@ typedef dword_t addr_t;
 typedef dword_t uint_t;
 typedef sdword_t int_t;
 
-typedef dword_t pid_t_;
+typedef sdword_t pid_t_;
 typedef dword_t uid_t_;
 typedef word_t mode_t_;
 typedef sqword_t off_t_;

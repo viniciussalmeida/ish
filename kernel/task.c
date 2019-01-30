@@ -15,6 +15,8 @@ static bool pid_empty(struct pid *pid) {
 }
 
 struct pid *pid_get(dword_t id) {
+    if (id > sizeof(pids)/sizeof(pids[0]))
+        return NULL;
     struct pid *pid = &pids[id];
     if (pid_empty(pid))
         return NULL;
@@ -38,11 +40,11 @@ struct task *pid_get_task(dword_t id) {
 
 struct task *task_create_(struct task *parent) {
     lock(&pids_lock);
-    static int cur_pid = 1;
-    while (!pid_empty(&pids[cur_pid])) {
+    static int cur_pid = 0;
+    do {
         cur_pid++;
         if (cur_pid > MAX_PID) cur_pid = 0;
-    }
+    } while (!pid_empty(&pids[cur_pid]));
     struct pid *pid = &pids[cur_pid];
     pid->id = cur_pid;
     list_init(&pid->session);
@@ -64,24 +66,21 @@ struct task *task_create_(struct task *parent) {
     if (parent != NULL) {
         task->parent = parent;
         list_add(&parent->children, &task->siblings);
-        list_add(&parent->pgroup, &task->pgroup);
-        list_add(&parent->session, &task->session);
     }
 
-    lock_init(&task->vfork_lock);
-    cond_init(&task->vfork_cond);
+    task->sockrestart = (struct task_sockrestart) {};
+    list_init(&task->sockrestart.listen);
+
     task->waiting_cond = NULL;
     task->waiting_lock = NULL;
     lock_init(&task->waiting_cond_lock);
+    cond_init(&task->pause);
     return task;
 }
 
 void task_destroy(struct task *task) {
     list_remove(&task->siblings);
-    list_remove(&task->pgroup);
-    list_remove(&task->session);
     pid_get(task->pid)->task = NULL;
-    cond_destroy(&task->vfork_cond);
     free(task);
 }
 
@@ -93,7 +92,7 @@ static void *task_run(void *task) {
         task_run_hook();
     else
         cpu_run(&current->cpu);
-    abort(); // above function call should never return
+    die("task_run returned"); // above function call should never return
 }
 
 static pthread_attr_t task_thread_attr;
@@ -104,5 +103,10 @@ __attribute__((constructor)) static void create_attr() {
 
 void task_start(struct task *task) {
     if (pthread_create(&task->thread, &task_thread_attr, task_run, task) < 0)
-        abort();
+        die("could not create thread");
+}
+
+int_t sys_sched_yield() {
+    sched_yield();
+    return 0;
 }

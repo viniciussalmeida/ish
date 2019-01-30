@@ -14,6 +14,8 @@ static inline void list_init(struct list *list) {
     list->prev = list;
 }
 
+#define LIST_INITIALIZER(x) {.prev = &x, .next = &x}
+
 static inline bool list_null(struct list *list) {
     return list->next == NULL && list->prev == NULL;
 }
@@ -27,6 +29,10 @@ static inline void _list_add_between(struct list *prev, struct list *next, struc
     item->prev = prev;
     item->next = next;
     next->prev = item;
+}
+
+static inline void list_add_before(struct list *list, struct list *item) {
+    _list_add_between(list->prev, list, item);
 }
 
 static inline void list_add(struct list *list, struct list *item) {
@@ -73,8 +79,8 @@ static inline void list_remove_safe(struct list *item) {
             &item->member != (list); \
             item = tmp, tmp = list_next_entry(item, member))
 
-static inline int list_size(struct list *list) {
-    int count = 0;
+static inline unsigned long list_size(struct list *list) {
+    unsigned long count = 0;
     struct list *item;
     list_for_each(list, item) {
         count++;

@@ -80,6 +80,7 @@
     ST(0) = f80_mod(ST(0), ST(1))
 
 #define FRNDINT() UNDEFINED
+#define FSCALE() UNDEFINED
 #define FYL2X() UNDEFINED
 #define F2XM1() UNDEFINED
 #define FSQRT() UNDEFINED
@@ -101,6 +102,7 @@
 #define FCOM() F_COMPARE(ST_i)
 #define FUCOM FCOM
 #define FCOMM(val,z) F_COMPARE(f80_from_float(get(val,z),z))
+#define FTST() F_COMPARE(fpu_consts[fconst_zero])
 
 #define FILD(val,z) \
     FPUSH(f80_from_int((sint(z)) get(val,z)))

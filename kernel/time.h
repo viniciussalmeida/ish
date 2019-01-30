@@ -5,8 +5,10 @@
 dword_t sys_time(addr_t time_out);
 #define CLOCK_REALTIME_ 0
 #define CLOCK_MONOTONIC_ 1
+#define CLOCK_PROCESS_CPUTIME_ID_ 2
 dword_t sys_clock_gettime(dword_t clock, addr_t tp);
 dword_t sys_clock_settime(dword_t clock, addr_t tp);
+dword_t sys_clock_getres(dword_t clock, addr_t res_addr);
 
 struct timeval_ {
     dword_t sec;
@@ -42,5 +44,7 @@ dword_t sys_times( addr_t tbuf);
 dword_t sys_nanosleep(addr_t req, addr_t rem);
 dword_t sys_gettimeofday(addr_t tv, addr_t tz);
 dword_t sys_settimeofday(addr_t tv, addr_t tz);
+
+fd_t sys_timerfd_create(int_t clockid, int_t flags);
 
 #endif

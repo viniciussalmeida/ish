@@ -1,22 +1,20 @@
+#include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include "kernel/calls.h"
 #include "fs/fd.h"
 #include "fs/sock.h"
 #include "debug.h"
 
-static struct fd_ops socket_fdops;
+const struct fd_ops socket_fdops;
 
 static fd_t sock_fd_create(int sock_fd, int flags) {
-    struct fd *fd = adhoc_fd_create();
+    struct fd *fd = adhoc_fd_create(&socket_fdops);
     if (fd == NULL)
         return _ENOMEM;
+    fd->stat.mode = S_IFSOCK | 0666;
     fd->real_fd = sock_fd;
-    fd->ops = &socket_fdops;
-    fd_t f = f_install(fd);
-    if (f >= 0)
-        if (flags & SOCK_CLOEXEC_)
-            f_set_cloexec(f);
-    return f;
+    return f_install(fd, flags);
 }
 
 dword_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
@@ -28,12 +26,18 @@ dword_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
     if (real_type < 0)
         return _EINVAL;
 
+    // this hack makes mtr work
+    if (type == SOCK_RAW_ && protocol == IPPROTO_RAW)
+        protocol = IPPROTO_ICMP;
+
     int sock = socket(real_domain, real_type, protocol);
     if (sock < 0)
         return errno_map();
     fd_t f = sock_fd_create(sock, type);
     if (f < 0)
         close(sock);
+    if (f >= 0)
+        f_get(f)->sockrestart.proto = protocol;
     return f;
 }
 
@@ -49,12 +53,12 @@ static int sockaddr_read(addr_t sockaddr_addr, void *sockaddr, size_t sockaddr_l
         return _EFAULT;
     struct sockaddr *real_addr = sockaddr;
     struct sockaddr_ *fake_addr = sockaddr;
-    switch (fake_addr->family) {
-        case PF_INET_:
-        case PF_INET6_:
-            real_addr->sa_family = fake_addr->family;
+    real_addr->sa_family = sock_family_to_real(fake_addr->family);
+    switch (real_addr->sa_family) {
+        case PF_INET:
+        case PF_INET6:
             break;
-        case PF_LOCAL_:
+        case PF_LOCAL:
             return _ENOENT; // lol
         default:
             return _EINVAL;
@@ -65,10 +69,10 @@ static int sockaddr_read(addr_t sockaddr_addr, void *sockaddr, size_t sockaddr_l
 static int sockaddr_write(addr_t sockaddr_addr, void *sockaddr, size_t sockaddr_len) {
     struct sockaddr *real_addr = sockaddr;
     struct sockaddr_ *fake_addr = sockaddr;
-    switch (real_addr->sa_family) {
+    fake_addr->family = sock_family_from_real(real_addr->sa_family);
+    switch (fake_addr->family) {
         case PF_INET_:
         case PF_INET6_:
-            fake_addr->family = real_addr->sa_family;
             break;
         case PF_LOCAL_:
             return _ENOENT; // lol
@@ -110,6 +114,50 @@ dword_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, dword_t sockaddr_len) {
     if (err < 0)
         return errno_map();
     return err;
+}
+
+dword_t sys_listen(fd_t sock_fd, int_t backlog) {
+    STRACE("listen(%d, %d)", sock_fd, backlog);
+    struct fd *sock = sock_getfd(sock_fd);
+    if (sock == NULL)
+        return _EBADF;
+    int err = listen(sock->real_fd, backlog);
+    if (err < 0)
+        return errno_map();
+    sockrestart_begin_listen(sock);
+    return err;
+}
+
+dword_t sys_accept(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr) {
+    STRACE("accept(%d, 0x%x, 0x%x)", sock_fd, sockaddr_addr, sockaddr_len_addr);
+    struct fd *sock = sock_getfd(sock_fd);
+    if (sock == NULL)
+        return _EBADF;
+    dword_t sockaddr_len;
+    if (user_get(sockaddr_len_addr, sockaddr_len))
+        return _EFAULT;
+
+    char sockaddr[sockaddr_len];
+    int client;
+    do {
+        sockrestart_begin_listen_wait(sock);
+        errno = 0;
+        client = accept(sock->real_fd, (void *) sockaddr, &sockaddr_len);
+        sockrestart_end_listen_wait(sock);
+    } while (sockrestart_should_restart_listen_wait() && errno == EINTR);
+    if (client < 0)
+        return errno_map();
+
+    int err = sockaddr_write(sockaddr_addr, sockaddr, sockaddr_len);
+    if (err < 0)
+        return client;
+    if (user_put(sockaddr_len_addr, sockaddr_len))
+        return _EFAULT;
+
+    fd_t client_f = sock_fd_create(client, 0);
+    if (client_f < 0)
+        close(client);
+    return client_f;
 }
 
 dword_t sys_getsockname(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr) {
@@ -273,7 +321,15 @@ dword_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value
     char value[value_len];
     if (user_read(value_addr, value, value_len))
         return _EFAULT;
-    int real_opt = sock_opt_to_real(option);
+
+    // ICMP6_FILTER can only be set on real SOCK_RAW
+    if (level == IPPROTO_ICMPV6 && option == ICMP6_FILTER_)
+        return 0;
+    // IP_MTU_DISCOVER has no equivalent on Darwin
+    if (level == IPPROTO_IP && option == IP_MTU_DISCOVER_)
+        return 0;
+
+    int real_opt = sock_opt_to_real(option, level);
     if (real_opt < 0)
         return _EINVAL;
     int real_level = sock_level_to_real(level);
@@ -297,7 +353,7 @@ dword_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value
     char value[value_len];
     if (user_read(value_addr, value, value_len))
         return _EFAULT;
-    int real_opt = sock_opt_to_real(option);
+    int real_opt = sock_opt_to_real(option, level);
     if (real_opt < 0)
         return _EINVAL;
     int real_level = sock_level_to_real(level);
@@ -309,10 +365,13 @@ dword_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value
         return errno_map();
 
     if (level == SOL_SOCKET_ && option == SO_TYPE_) {
+        // TODO Find a way to get the socket protocol so we can return SOCK_RAW_ for
+        // our fake raw sockets (SO_PROTOCOL is not available).
+
         dword_t *type = (dword_t *) &value[0];
         switch (*type) {
-            case SOCK_STREAM_: *type = SOCK_STREAM; break;
-            case SOCK_DGRAM_: *type = SOCK_DGRAM; break;
+            case SOCK_STREAM: *type = SOCK_STREAM_; break;
+            case SOCK_DGRAM: *type = SOCK_DGRAM_; break;
         }
     }
 
@@ -323,39 +382,168 @@ dword_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value
     return 0;
 }
 
-static struct fd_ops socket_fdops = {
+dword_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, dword_t flags) {
+    STRACE("recvmsg(%d, 0x%x, %d)", sock_fd, msghdr_addr, flags);
+    struct fd *sock = sock_getfd(sock_fd);
+    if (sock == NULL)
+        return _EBADF;
+
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+
+    struct msghdr_ msg_fake;
+    if (user_get(msghdr_addr, msg_fake)) {
+        return _EFAULT;
+    }
+
+    // msg_name
+    struct sockaddr msg_name;
+    memset(&msg_name, 0, sizeof(msg_name));
+
+    struct sockaddr_ msg_name_fake;
+    if (msg_fake.msg_name != 0 && msg_fake.msg_namelen != 0) {
+        if (user_get(msg_fake.msg_name, msg_name_fake))
+            return _EFAULT;
+#ifdef __APPLE__
+        msg_name.sa_len = sizeof(msg_name);
+#endif
+        msg_name.sa_family = msg_name_fake.family;
+        memcpy(&msg_name.sa_data, msg_name_fake.data, sizeof(msg_name_fake.data));
+
+        msg.msg_name = (void *)&msg_name;
+        msg.msg_namelen = sizeof(msg_name);
+    }
+
+    // msg_control (no initial content)
+    char msg_control[msg_fake.msg_controllen];
+    memset(&msg_control, 0, sizeof(msg_control));
+
+    msg.msg_control = (void *)&msg_control;
+    msg.msg_controllen = sizeof(msg_control);
+
+    // msg_iovec (no initial content)
+    struct iovec msg_iov[msg_fake.msg_iovlen];
+    memset(&msg_iov, 0, sizeof(msg_iov));
+
+    struct iovec_ msg_iov_fake[msg_fake.msg_iovlen];
+    if (user_get(msg_fake.msg_iov, msg_iov_fake))
+        return _EFAULT;
+
+    for (uint_t i = 0; i < msg_fake.msg_iovlen; i++) {
+        char iov_base[msg_iov_fake[i].iov_len];
+        memset(&iov_base, 0, sizeof(iov_base));
+
+        msg_iov[i].iov_base = (void *)&iov_base;
+        msg_iov[i].iov_len = sizeof(iov_base);
+    }
+
+    msg.msg_iov = (void *)&msg_iov;
+    msg.msg_iovlen = msg_fake.msg_iovlen;
+
+    // msg_flags (no initial content)
+    msg.msg_flags = sock_flags_to_real(msg_fake.msg_flags);
+
+    int real_flags = sock_flags_to_real(flags);
+    if (real_flags < 0)
+        return _EINVAL;
+
+    ssize_t res = recvmsg(sock->real_fd, &msg, real_flags);
+
+    // msg_name (changed)
+    memset(&msg_name_fake, 0, sizeof(msg_name_fake));
+
+    if (msg.msg_name != 0 && msg.msg_namelen != 0) {
+        struct sockaddr *msg_name = msg.msg_name;
+
+        msg_name_fake.family = msg_name->sa_family;
+        memcpy(&msg_name_fake.data, msg_name->sa_data, sizeof(msg_name->sa_data));
+
+        if (user_put(msg_fake.msg_name, msg_name_fake)) {
+            return _EFAULT;
+        }
+        msg_fake.msg_namelen = sizeof(msg_name_fake);
+    }
+
+    // msg_control (changed)
+    uint_t message_offset = 0;
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        void *cmsg_data = CMSG_DATA(cmsg);
+        uint_t cmsg_data_size = cmsg->cmsg_len - sizeof(cmsg);
+
+        if (user_write(msg_fake.msg_control + message_offset, cmsg, sizeof(cmsg)))
+            return _EFAULT;
+
+        if (user_write(msg_fake.msg_control + message_offset + sizeof(cmsg), cmsg_data, cmsg_data_size))
+            return _EFAULT;
+
+        message_offset += cmsg->cmsg_len;
+    }
+
+    msg_fake.msg_controllen = message_offset;
+
+    // msg_iovec (changed)
+    for (int i = 0; i < msg.msg_iovlen; i++) {
+        if (user_write(msg_iov_fake[i].iov_base, msg_iov[i].iov_base, msg_iov[i].iov_len))
+            return _EFAULT;
+
+        msg_iov_fake[i].iov_len = msg_iov[i].iov_len;
+    }
+
+    if (user_put(msg_fake.msg_iov, msg_iov_fake))
+        return _EFAULT;
+
+    // msg_flags (changed)
+    msg_fake.msg_flags = sock_flags_from_real(msg.msg_flags);
+
+    if (user_put(msghdr_addr, msg_fake)) {
+        return _EFAULT;
+    }
+
+    if (res < 0)
+        return errno_map();
+    return res;
+}
+
+static int sock_close(struct fd *fd) {
+    sockrestart_end_listen(fd);
+    return realfs_close(fd);
+}
+
+const struct fd_ops socket_fdops = {
     .read = realfs_read,
     .write = realfs_write,
-    .close = realfs_close,
+    .close = sock_close,
+    .poll = realfs_poll,
     .getflags = realfs_getflags,
     .setflags = realfs_setflags,
 };
 
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 static struct socket_call {
     syscall_t func;
     int args;
 } socket_calls[] = {
-    {NULL, 0},
+    {NULL},
     {(syscall_t) sys_socket, 3},
     {(syscall_t) sys_bind, 3},
     {(syscall_t) sys_connect, 3},
-    {NULL, 0}, // listen
-    {NULL, 0}, // accept
-    {(syscall_t) sys_getsockname, 3}, // getsockname
-    {(syscall_t) sys_getpeername, 3}, // getpeername
-    {(syscall_t) sys_socketpair, 4}, // socketpair
-    {NULL, 0}, // send
-    {NULL, 0}, // recv
-    {(syscall_t) sys_sendto, 6}, // sendto
-    {(syscall_t) sys_recvfrom, 6}, // recvfrom
-    {(syscall_t) sys_shutdown, 2}, // shutdown
-    {(syscall_t) sys_setsockopt, 5}, // setsockopt
-    {(syscall_t) sys_getsockopt, 5}, // getsockopt
-    {NULL, 0}, // sendmsg
-    {NULL, 0}, // recvmsg
-    {NULL, 0}, // accept4
-    {NULL, 0}, // recvmmsg
-    {NULL, 0}, // sendmmsg
+    {(syscall_t) sys_listen, 2},
+    {(syscall_t) sys_accept, 3},
+    {(syscall_t) sys_getsockname, 3},
+    {(syscall_t) sys_getpeername, 3},
+    {(syscall_t) sys_socketpair, 4},
+    {NULL}, // send
+    {NULL}, // recv
+    {(syscall_t) sys_sendto, 6},
+    {(syscall_t) sys_recvfrom, 6},
+    {(syscall_t) sys_shutdown, 2},
+    {(syscall_t) sys_setsockopt, 5},
+    {(syscall_t) sys_getsockopt, 5},
+    {NULL}, // sendmsg
+    {(syscall_t) sys_recvmsg, 3},
+    {NULL}, // accept4
+    {NULL}, // recvmmsg
+    {NULL}, // sendmmsg
 };
 
 dword_t sys_socketcall(dword_t call_num, addr_t args_addr) {
@@ -364,7 +552,7 @@ dword_t sys_socketcall(dword_t call_num, addr_t args_addr) {
         return _EINVAL;
     struct socket_call call = socket_calls[call_num];
     if (call.func == NULL) {
-        TODO("socketcall %d", call_num);
+        FIXME("socketcall %d", call_num);
         return _ENOSYS;
     }
 

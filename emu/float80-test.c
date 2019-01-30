@@ -44,7 +44,6 @@ void assertf(int cond, const char *msg, ...) {
     }
 
     printf(cond ? "PASS ": "FAIL ");
-    //if (!cond) asm("int3");
     char buf[1024];
     va_list args;
     va_start(args, msg);
@@ -68,6 +67,15 @@ void test_int_convert() {
     test(9489919999192); test(-9489919999192);
     test(INT64_MIN); test(INT64_MAX);
 #undef test
+
+#define test(x) \
+    u.f = f80_from_double(x); \
+    i = f80_to_int(u.f); \
+    assertf(i == (int64_t)round(x), "f80_to_int(f80_from_double(%.20Le)) = %ld", u.ld, i)
+
+    test(0.75); test(-0.75);
+#undef test
+
     suite_end();
 }
 
@@ -105,7 +113,7 @@ void test_math() {
     ua.ld = a; ub.ld = b; \
     u.f = f80_##op(ua.f, ub.f); \
     expected = (long double) a cop_##op (long double) b; \
-    assertf(bitwise_eq(u.ld, expected), "f80_"#op"(%Le, %Le) = %Le", ua.ld, ub.ld, u.ld)
+    assertf(bitwise_eq(u.ld, expected), "f80_"#op"(%Le, %Le) = %Le (%Le)", ua.ld, ub.ld, u.ld, expected)
 #define test(op, a, b) \
     _test(op, a, b); \
     _test(op, -a, b); \
@@ -121,6 +129,9 @@ void test_math() {
     test(add, 1e100, 100);
     test(add, 1e-4949l, 1);
     test(add, 1e-4949l, 1e-4949l);
+    test(add, 1e-4949l, 2e-4949l);
+    test(add, 18446744073709551616.l, 1.5);
+    test(add, INFINITY, 1);
     test(add, INFINITY, 123);
     test(add, INFINITY, INFINITY);
     test(add, NAN, 123);

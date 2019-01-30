@@ -10,17 +10,9 @@ int mount_root(const struct fs_ops *fs, const char *source) {
     char source_realpath[MAX_PATH + 1];
     if (realpath(source, source_realpath) == NULL)
         return errno_map();
-    mounts = malloc(sizeof(struct mount));
-    mounts->point = "";
-    mounts->source = strdup(source_realpath);
-    mounts->fs = fs;
-    mounts->next = NULL;
-    mounts->data = NULL;
-    if (fs->mount) {
-        int err = fs->mount(mounts);
-        if (err < 0)
-            return err;
-    }
+    int err = do_mount(fs, source_realpath, "");
+    if (err < 0)
+        return err;
     return 0;
 }
 
@@ -32,6 +24,7 @@ static struct tgroup *init_tgroup() {
     list_init(&group->threads);
     lock_init(&group->lock);
     cond_init(&group->child_exit);
+    cond_init(&group->stopped_cond);
     return group;
 }
 
@@ -46,7 +39,8 @@ void create_first_process() {
     signal(SIGPIPE, SIG_IGN);
 
     current = task_create_(NULL);
-    current->mem = current->cpu.mem = mem_new();
+    current->mm = mm_new();
+    current->mem = current->cpu.mem = &current->mm->mem;
     struct tgroup *group = init_tgroup();
     list_add(&group->threads, &current->group_links);
     group->leader = current;
@@ -68,14 +62,15 @@ void create_first_process() {
     sys_setsid();
 }
 
-int create_stdio(struct tty_driver driver) {
+int create_stdio(struct tty_driver *driver) {
     // I can't wait for when init and udev works and I don't need to do this
-    tty_drivers[TTY_VIRTUAL] = driver;
+    tty_drivers[TTY_CONSOLE_MAJOR] = driver;
 
     // FIXME use generic_open (or something) to avoid this mess
-    struct fd *fd = adhoc_fd_create();
+    struct fd *fd = adhoc_fd_create(NULL);
     fd->stat.rdev = dev_make(4, 0);
     fd->stat.mode = S_IFCHR | S_IRUSR;
+    fd->flags = O_RDWR_;
     int err = dev_open(4, 0, DEV_CHAR, fd);
     if (err < 0)
         return err;

@@ -1,5 +1,6 @@
-#include <signal.h>
+#include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include "kernel/init.h"
 #include "kernel/fs.h"
 
@@ -55,7 +56,7 @@ static inline int xX_main_Xx(int argc, char *const argv[], char *const *envp) {
     err = sys_execve(argv[optind], argv + optind, envp);
     if (err < 0)
         return err;
-    err = create_stdio(real_tty_driver);
+    err = create_stdio(&real_tty_driver);
     if (err < 0)
         return err;
     exit_hook = exit_handler;

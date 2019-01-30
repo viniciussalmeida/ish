@@ -1,4 +1,5 @@
 #include "gadgets.h"
+#include "math.h"
 
 #define REP_LIST once,rep,repnz
 
@@ -37,7 +38,7 @@
         .ifc \op,lods
             mov _addr, esi
             read_prep \size, \op\size\()_\rep
-            ldr\s eax, [_xaddr]
+            ldrs eax, [_xaddr], \s
 
         .else N .ifc \op,stos
             mov _addr, edi
@@ -57,10 +58,10 @@
         .else N .ifc \op, scas
             mov _addr, edi
             read_prep \size, \op\size\()_\rep
-            ldr\s _tmp, [_xaddr]
-            setf_a eax, _tmp
-            subs _tmp, _tmp, eax
-            setf_oc
+            ldr\s w8, [_xaddr]
+            mov _tmp, eax
+            setf_a src=w8, dst=_tmp
+            do_add sub, _tmp, w8, \s
             setf_zsp \s
 
         .else N .ifc \op, cmps
@@ -70,9 +71,8 @@
             mov _addr, edi
             read_prep \size, \op\size\()_\rep\()2
             ldr\s w8, [_xaddr]
-            setf_a w8, _tmp
-            subs _tmp, _tmp, w8
-            setf_oc
+            setf_a src=w8, dst=_tmp
+            do_add sub, _tmp, w8, \s
             setf_zsp \s
         .endif N .endif N .endif N .endif N .endif
 

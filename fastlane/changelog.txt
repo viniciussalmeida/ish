@@ -1,5 +1,27 @@
-So many fixed programs, I can't remember all of them. It's kinda usable now, and guess what, ed works! I managed to download a tarball of TCC and build it from source.
+New stuff:
+- pseudoterminals (in other words, you can now ssh into your phone)
+- 1337 h4x0r colorscheme
+- Command-K clears the screen
+- bit testing instructions implemented
 
-As always, let me know if it crashes spectacularly. The best place to send bug reports or feedback of any kind is the GitHub issues page: https://github.com/tbodt/ish/issues
+Bug fixes:
+- DNS configuration not working for IPv6 servers
+- [invalid utf8]
+- Crash when attempting to use negative file descriptors
+- Various other memory leaks and segfaults
 
-Commits since last build:
+Here's a quick step by step guide for running an ssh server.
+1. apk add openssh
+2. ssh-keygen -A
+3. passwd
+4. type a password
+5. /usr/sbin/sshd
+You should now be able to ssh to your device with username root and the password you typed.
+
+If you switch to another app and switch back, the ssh server will stop responding even though it's still running. Fixing this is actually really hard; help would be appreciated.
+
+Send bug reports or feedback here: https://github.com/tbodt/ish/issues (or by email, if you prefer)
+Follow iSH on Twitter: https://twitter.com/iSH_app
+Join the Discord: https://discord.gg/SndDh5y
+Give me money: https://patreon.com/tbodt
+

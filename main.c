@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <string.h>
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "xX_main_Xx.h"
@@ -12,5 +13,7 @@ int main(int argc, char *const argv[]) {
         fprintf(stderr, "%s\n", strerror(-err));
         return err;
     }
+    do_mount(&procfs, "proc", "/proc");
+    do_mount(&devptsfs, "devpts", "/dev/pts");
     cpu_run(&current->cpu);
 }

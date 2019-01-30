@@ -80,31 +80,52 @@ struct uc_regs {
     dword_t esp;
     dword_t eip;
     dword_t eflags;
+    word_t fpcw;
+    word_t fpsw;
+    float80 fp[8];
+};
+static int uc_regs_ids[] = {
+    UC_X86_REG_EAX, UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDX,
+    UC_X86_REG_ESI, UC_X86_REG_EDI, UC_X86_REG_EBP, UC_X86_REG_ESP,
+    UC_X86_REG_EIP, UC_X86_REG_EFLAGS,
+    UC_X86_REG_FPCW, UC_X86_REG_FPSW,
+    UC_X86_REG_FP0, UC_X86_REG_FP1, UC_X86_REG_FP2, UC_X86_REG_FP3,
+    UC_X86_REG_FP4, UC_X86_REG_FP5, UC_X86_REG_FP6, UC_X86_REG_FP7,
 };
 void uc_getregs(uc_engine *uc, struct uc_regs *regs) {
-    static int uc_regs_ids[] = {
-        UC_X86_REG_EAX, UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDX,
-        UC_X86_REG_ESI, UC_X86_REG_EDI, UC_X86_REG_EBP, UC_X86_REG_ESP,
-        UC_X86_REG_EIP, UC_X86_REG_EFLAGS,
-    };
     void *ptrs[sizeof(uc_regs_ids)/sizeof(uc_regs_ids[0])] = {
         &regs->eax, &regs->ebx, &regs->ecx, &regs->edx,
         &regs->esi, &regs->edi, &regs->ebp, &regs->esp,
         &regs->eip, &regs->eflags,
+        &regs->fpcw, &regs->fpsw,
+        &regs->fp[0], &regs->fp[1], &regs->fp[2], &regs->fp[3],
+        &regs->fp[4], &regs->fp[5], &regs->fp[6], &regs->fp[7],
     };
     uc_trycall(uc_reg_read_batch(uc, uc_regs_ids, ptrs, sizeof(ptrs)/sizeof(ptrs[0])), "uc_reg_read_batch");
 }
+void uc_setregs(uc_engine *uc, struct uc_regs *regs) {
+    void *const ptrs[sizeof(uc_regs_ids)/sizeof(uc_regs_ids[0])] = {
+        &regs->eax, &regs->ebx, &regs->ecx, &regs->edx,
+        &regs->esi, &regs->edi, &regs->ebp, &regs->esp,
+        &regs->eip, &regs->eflags,
+        &regs->fpcw, &regs->fpsw,
+        &regs->fp[0], &regs->fp[1], &regs->fp[2], &regs->fp[3],
+        &regs->fp[4], &regs->fp[5], &regs->fp[6], &regs->fp[7],
+    };
+    uc_trycall(uc_reg_write_batch(uc, uc_regs_ids, ptrs, sizeof(ptrs)/sizeof(ptrs[0])), "uc_reg_write_batch");
+}
 
 int compare_cpus(struct cpu_state *cpu, struct tlb *tlb, uc_engine *uc, int undefined_flags) {
+    int res = 0;
     struct uc_regs regs;
     uc_getregs(uc, &regs);
     collapse_flags(cpu);
 
 #define CHECK(uc, ish, name) \
     if ((uc) != (ish)) { \
-        printk(name ": uc 0x%llx, ish 0x%llx\n", (unsigned long long) (uc), (unsigned long long) (ish)); \
-        debugger; \
-        return -1; \
+        printk("check failed: " name ": uc 0x%llx, ish 0x%llx\n", (unsigned long long) (uc), (unsigned long long) (ish)); \
+        res = -1; \
+        ish = uc; \
     }
 
 #define CHECK_REG(reg) \
@@ -128,17 +149,36 @@ int compare_cpus(struct cpu_state *cpu, struct tlb *tlb, uc_engine *uc, int unde
 #undef f
 #define f(x,n) ((cpu->eflags & (1 << n)) ? #x : "-"),
                 cpu->eflags, f(o,11)f(d,10)f(i,9)f(t,8)f(s,7)f(z,6)f(a,4)f(p,2)f(c,0)0);
-        debugger;
-        return -1;
+        res = -1;
+        cpu->eflags = regs.eflags;
     }
     // sync up the flags so undefined flags won't error out next time
-    uc_setreg(uc, UC_X86_REG_EFLAGS, regs.eflags);
+
+#define FSW_MASK 0x7d00 // only look at top, c0, c2, c3
+    regs.fpsw &= FSW_MASK;
+    cpu->fsw &= FSW_MASK;
+    CHECK(regs.fpsw, cpu->fsw, "fsw");
+    CHECK(regs.fpcw, cpu->fcw, "fcw");
+
+#define CHECK_FPREG(i) \
+    CHECK(regs.fp[i].signif, cpu->fp[i].signif, "fp"#i" signif"); \
+    CHECK(regs.fp[i].signExp, cpu->fp[i].signExp, "fp"#i" signExp")
+    CHECK_FPREG(0);
+    CHECK_FPREG(1);
+    CHECK_FPREG(2);
+    CHECK_FPREG(3);
+    CHECK_FPREG(4);
+    CHECK_FPREG(5);
+    CHECK_FPREG(6);
+    CHECK_FPREG(7);
+
+    uc_setregs(uc, &regs);
 
     // compare pages marked dirty
     if (tlb->dirty_page != TLB_PAGE_EMPTY) {
         char real_page[PAGE_SIZE];
         uc_trycall(uc_mem_read(uc, tlb->dirty_page, real_page, PAGE_SIZE), "compare read");
-        struct pt_entry entry = cpu->mem->pt[PAGE(tlb->dirty_page)];
+        struct pt_entry entry = *mem_pt(cpu->mem, PAGE(tlb->dirty_page));
         void *fake_page = entry.data->data + entry.offset;
 
         if (memcmp(real_page, fake_page, PAGE_SIZE) != 0) {
@@ -149,7 +189,7 @@ int compare_cpus(struct cpu_state *cpu, struct tlb *tlb, uc_engine *uc, int unde
         tlb->dirty_page = TLB_PAGE_EMPTY;
     }
 
-    return 0;
+    return res;
 }
 
 static int uc_interrupt;
@@ -164,8 +204,8 @@ static void _mem_sync(struct tlb *tlb, uc_engine *uc, addr_t addr, dword_t size)
 #define mem_sync(addr, size) _mem_sync(tlb, uc, addr, size)
 void step_tracing(struct cpu_state *cpu, struct tlb *tlb, uc_engine *uc) {
     // step ish
-    addr_t old_brk = current->mem->brk; // this is important
-    int changes = cpu->mem->changes;
+    addr_t old_brk = current->mm->brk; // this is important
+    unsigned changes = cpu->mem->changes;
     int interrupt = cpu_step32(cpu, tlb);
     if (interrupt != INT_NONE) {
         cpu->trapno = interrupt;
@@ -178,7 +218,7 @@ void step_tracing(struct cpu_state *cpu, struct tlb *tlb, uc_engine *uc) {
     uc_interrupt = -1;
     dword_t eip = uc_getreg(uc, UC_X86_REG_EIP);
     // intercept cpuid and rdtsc
-    char code[2];
+    uint8_t code[2];
     uc_read(uc, eip, code, sizeof(code));
     if (code[0] == 0x0f && (code[1] == 0x31 || code[1] == 0xa2)) {
         if (code[1] == 0x31) {
@@ -214,7 +254,7 @@ void step_tracing(struct cpu_state *cpu, struct tlb *tlb, uc_engine *uc) {
             case 54: { // ioctl (god help us)
                 struct fd *fd = f_get(cpu->ebx);
                 if (fd && fd->ops->ioctl_size) {
-                    ssize_t ioctl_size = fd->ops->ioctl_size(fd, cpu->ecx);
+                    ssize_t ioctl_size = fd->ops->ioctl_size(cpu->ecx);
                     if (ioctl_size >= 0)
                         mem_sync(regs.edx, ioctl_size);
                 }
@@ -309,11 +349,11 @@ void step_tracing(struct cpu_state *cpu, struct tlb *tlb, uc_engine *uc) {
                 break;
 
             case 45: // brk
-                // matches up with the login in kernel/mmap.c
-                if (current->mem->brk > old_brk) {
-                    uc_map(uc, BYTES_ROUND_UP(old_brk), BYTES_ROUND_UP(current->mem->brk) - BYTES_ROUND_UP(old_brk));
-                } else if (current->mem->brk < old_brk) {
-                    uc_unmap(uc, BYTES_ROUND_DOWN(current->mem->brk), BYTES_ROUND_DOWN(old_brk) - BYTES_ROUND_DOWN(current->mem->brk));
+                // matches up with the logic in kernel/mmap.c
+                if (current->mm->brk > old_brk) {
+                    uc_map(uc, BYTES_ROUND_UP(old_brk), BYTES_ROUND_UP(current->mm->brk) - BYTES_ROUND_UP(old_brk));
+                } else if (current->mm->brk < old_brk) {
+                    uc_unmap(uc, BYTES_ROUND_DOWN(current->mm->brk), BYTES_ROUND_DOWN(old_brk) - BYTES_ROUND_DOWN(current->mm->brk));
                 }
                 break;
 
@@ -333,15 +373,15 @@ void step_tracing(struct cpu_state *cpu, struct tlb *tlb, uc_engine *uc) {
     }
 }
 
-static void uc_interrupt_callback(uc_engine *uc, uint32_t interrupt, void *user_data) {
+static void uc_interrupt_callback(uc_engine *uc, uint32_t interrupt, void *UNUSED(user_data)) {
     uc_interrupt = interrupt;
     uc_emu_stop(uc);
 }
 
-static bool uc_unmapped_callback(uc_engine *uc, uc_mem_type type, uint64_t address, int size, int64_t value, void *user_data) {
-    struct pt_entry *pt = &current->mem->pt[PAGE(address)];
+static bool uc_unmapped_callback(uc_engine *uc, uc_mem_type UNUSED(type), uint64_t address, int size, int64_t UNUSED(value), void *UNUSED(user_data)) {
+    struct pt_entry *pt = mem_pt(current->mem, PAGE(address));
     // handle stack growing
-    if (pt->flags & P_GROWSDOWN) {
+    if (pt != NULL && pt->flags & P_GROWSDOWN) {
         uc_map(uc, BYTES_ROUND_DOWN(address), PAGE_SIZE);
         return true;
     }
@@ -413,13 +453,14 @@ uc_engine *start_unicorn(struct cpu_state *cpu, struct mem *mem) {
     uc_setreg(uc, UC_X86_REG_ESP, cpu->esp);
     uc_setreg(uc, UC_X86_REG_EIP, cpu->eip);
     uc_setreg(uc, UC_X86_REG_EFLAGS, cpu->eflags);
+    uc_setreg(uc, UC_X86_REG_FPCW, cpu->fcw);
 
     // copy memory
     // XXX unicorn has a ?bug? where setting up 334 mappings takes five
     // seconds on my raspi. it seems to be accidentally quadratic (dot tumblr dot com)
     for (page_t page = 0; page < MEM_PAGES; page++) {
-        struct pt_entry *pt = &mem->pt[page];
-        if (pt->data == NULL)
+        struct pt_entry *pt = mem_pt(mem, page);
+        if (pt == NULL)
             continue;
         int prot = UC_PROT_READ | UC_PROT_EXEC;
         // really only the write bit is meaningful (FIXME)
@@ -450,7 +491,7 @@ int main(int argc, char *const argv[]) {
     }
 
     // create a unicorn and set it up exactly the same as the current process
-    uc_engine *uc = start_unicorn(&current->cpu, current->mem);
+    uc_engine *uc = start_unicorn(&current->cpu, &current->mm->mem);
 
     struct cpu_state *cpu = &current->cpu;
     struct tlb tlb;
@@ -477,3 +518,4 @@ void dump_memory(uc_engine *uc, const char *file, addr_t start, size_t size) {
     fwrite(buf, 1, sizeof(buf), f);
     fclose(f);
 }
+
