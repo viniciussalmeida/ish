@@ -11,6 +11,9 @@ int path_normalize(struct fd *at, const char *path, char *out, bool follow_links
     *o = '\0';
     int n = MAX_PATH - 1;
 
+    if (strcmp(path, "") == 0)
+        return _ENOENT;
+
     if (at != __NO_AT) {
         // start with root or cwd, depending on whether it starts with a slash
         lock(&current->fs->lock);
@@ -46,10 +49,12 @@ int path_normalize(struct fd *at, const char *path, char *out, bool follow_links
                 continue;
             } else if (p[1] == '.' && (p[2] == '\0' || p[2] == '/')) {
                 // double dot path component, delete the last component
-                do {
-                    o--;
-                    n++;
-                } while (*o != '/');
+                if (o != out) {
+                    do {
+                        o--;
+                        n++;
+                    } while (*o != '/');
+                }
                 p += 2;
                 while (*p == '/')
                     p++;

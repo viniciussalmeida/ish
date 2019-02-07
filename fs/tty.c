@@ -113,6 +113,7 @@ void tty_release(struct tty *tty) {
 static void tty_set_controlling(struct tgroup *group, struct tty *tty) {
     lock(&group->lock);
     if (group->tty == NULL) {
+        tty->refcount++;
         group->tty = tty;
         tty->session = group->sid;
         tty->fg_group = group->pgid;
@@ -179,7 +180,7 @@ static int tty_open(int major, int minor, struct fd *fd) {
 static int tty_close(struct fd *fd) {
     if (fd->tty != NULL) {
         lock(&fd->tty->fds_lock);
-        list_remove(&fd->other_fds);
+        list_remove_safe(&fd->other_fds);
         unlock(&fd->tty->fds_lock);
         lock(&ttys_lock);
         tty_release(fd->tty);
@@ -282,7 +283,7 @@ int tty_input(struct tty *tty, const char *input, size_t size, bool blocking) {
             } else if (ch == cc[VEOF_]) {
                 ch = '\0';
                 goto canon_wake;
-            } else if (ch == '\n' || ch == cc[VEOL_]) {
+            } else if (ch == '\n' || (cc[VEOL_] != '\0' && ch == cc[VEOL_])) {
                 // echo it now, before the read call goes through
                 if (echo)
                     tty_echo(tty, "\r\n", 2);
@@ -383,6 +384,9 @@ static ssize_t tty_read(struct fd *fd, void *buf, size_t bufsize) {
             err = _EIO;
             if (pty_is_half_closed_master(tty))
                 goto out;
+            err = _EAGAIN;
+            if (fd->flags & O_NONBLOCK_)
+                goto out;
             err = wait_for(&tty->produced, &tty->lock, NULL);
             if (err < 0)
                 goto out;
@@ -406,6 +410,12 @@ static ssize_t tty_read(struct fd *fd, void *buf, size_t bufsize) {
             timeout_ptr = NULL;
 
         while (tty->bufsize < min) {
+            err = _EIO;
+            if (pty_is_half_closed_master(tty))
+                goto out;
+            err = _EAGAIN;
+            if (fd->flags & O_NONBLOCK_)
+                goto out;
             // there should be no timeout for the first character read
             err = wait_for(&tty->produced, &tty->lock, tty->bufsize == 0 ? NULL : timeout_ptr);
             if (err == _ETIMEDOUT)
@@ -431,13 +441,6 @@ out:
     return err;
 }
 
-static ssize_t tty_driver_write(struct tty *tty, const char *data, size_t size, bool blocking) {
-    int err = tty->driver->ops->write(tty, data, size, blocking);
-    if (err < 0)
-        return err;
-    return size;
-}
-
 static ssize_t tty_write(struct fd *fd, const void *buf, size_t bufsize) {
     struct tty *tty = fd->tty;
     lock(&tty->lock);
@@ -454,7 +457,11 @@ static ssize_t tty_write(struct fd *fd, const void *buf, size_t bufsize) {
     unlock(&tty->lock);
 
     int err = 0;
+    char *postbuf = NULL;
+    size_t postbufsize = bufsize;
     if (oflags & OPOST_) {
+        postbuf = malloc(bufsize * 2);
+        postbufsize = 0;
         const char *cbuf = buf;
         for (size_t i = 0; i < bufsize; i++) {
             char ch = cbuf[i];
@@ -462,18 +469,15 @@ static ssize_t tty_write(struct fd *fd, const void *buf, size_t bufsize) {
                 continue;
             else if (ch == '\r' && oflags & OCRNL_)
                 ch = '\n';
-            else if (ch == '\n' && oflags & ONLCR_) {
-                err = tty_driver_write(tty, "\r", 1, blocking);
-                if (err < 0)
-                    break;
-            }
-            err = tty_driver_write(tty, &ch, 1, blocking);
-            if (err < 0)
-                break;
+            else if (ch == '\n' && oflags & ONLCR_)
+                postbuf[postbufsize++] = '\r';
+            postbuf[postbufsize++] = ch;
         }
-    } else {
-        err = tty_driver_write(tty, buf, bufsize, blocking);
+        buf = postbuf;
     }
+    err = tty->driver->ops->write(tty, buf, postbufsize, blocking);
+    if (postbuf)
+        free(postbuf);
     if (err < 0)
         return err;
     return bufsize;
@@ -545,7 +549,10 @@ static int tiocsctty(struct tty *tty, int force) {
             struct tgroup *tgroup;
             list_for_each_entry(&pid->session, tgroup, session) {
                 lock(&tgroup->lock);
-                tgroup->tty = NULL;
+                if (tgroup->tty == tty) {
+                    tgroup->tty = NULL;
+                    tty->refcount--;
+                }
                 unlock(&tgroup->lock);
             }
         } else {
